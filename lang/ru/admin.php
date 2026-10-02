@@ -77,6 +77,7 @@ return array_replace_recursive($base, [
         ],
     ],
     'ui_v3' => [
+        'sidebar_community' => 'Присоединиться к сообществу',
         'install_workbench' => 'Установить приложение',
         'install_workbench_label' => 'Установить рабочее приложение GEOWorkFlow',
         'recent' => 'Недавние',
@@ -227,8 +228,6 @@ return array_replace_recursive($base, [
     ],
     'footer' => [
         'version' => 'Версия :version',
-        'author' => 'Автор: Yao Jingang',
-        'author_x_profile' => 'Профиль автора в X',
         'project_github_link' => 'GitHub проекта',
         'changelog_link' => 'История изменений',
         'help_docs_link' => 'Документация',

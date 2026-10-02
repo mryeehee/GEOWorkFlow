@@ -3,7 +3,6 @@ Copyright © 2026 姚金刚. All rights reserved.
 Project: geoflow
 Created by: 姚金刚
 Date: 2026-07-05
-X: https://x.com/yaojingang
 -->
 
 # Operation Boundary

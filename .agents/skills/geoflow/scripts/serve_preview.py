@@ -3,7 +3,6 @@
 # Project: geoflow
 # Created by: 姚金刚
 # Date: 2026-05-16
-# X: https://x.com/yaojingang
 
 import argparse
 from functools import partial

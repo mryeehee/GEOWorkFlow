@@ -4,7 +4,6 @@
     $accountName = trim((string) $admin->name) ?: (string) $admin->username;
     $accountInitial = \Illuminate\Support\Str::upper(\Illuminate\Support\Str::substr($accountName, 0, 1));
     $projectGithubUrl = 'https://github.com/mryeehee/GEOWorkFlow';
-    $authorXUrl = 'https://x.com/yaojingang';
 @endphp
 <div class="gf-modal-backdrop" data-gf-modal="account" hidden>
     <section class="gf-modal" role="dialog" aria-modal="true" aria-labelledby="gf-account-title">
@@ -34,9 +33,9 @@
             <figure class="gf-community-dialog__qr">
                 <div class="gf-community-dialog__qr-frame">
                     <img
-                        src="{{ asset('assets/images/yao-jingang-wechat.jpg') }}"
-                        width="888"
-                        height="1128"
+                        src="{{ asset('assets/images/geoworkflow-wechat.jpg') }}"
+                        width="592"
+                        height="752"
                         alt="{{ __('admin.ui_v3.qr_image_alt') }}"
                     >
                 </div>
@@ -53,11 +52,6 @@
                     <a href="{{ $projectGithubUrl }}" target="_blank" rel="noopener noreferrer">
                         <span class="gf-community-links__icon"><i data-lucide="git-fork" aria-hidden="true"></i></span>
                         <span><strong>GitHub</strong><small>{{ __('admin.ui_v3.qr_github_hint') }}</small></span>
-                        <i data-lucide="arrow-up-right" aria-hidden="true"></i>
-                    </a>
-                    <a href="{{ $authorXUrl }}" target="_blank" rel="noopener noreferrer">
-                        <span class="gf-community-links__icon gf-community-links__icon--x" aria-hidden="true">X</span>
-                        <span><strong>{{ __('admin.ui_v3.qr_x_label') }}</strong><small>{{ __('admin.ui_v3.qr_x_hint') }}</small></span>
                         <i data-lucide="arrow-up-right" aria-hidden="true"></i>
                     </a>
                 </nav>

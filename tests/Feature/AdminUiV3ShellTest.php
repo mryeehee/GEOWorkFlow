@@ -59,7 +59,7 @@ class AdminUiV3ShellTest extends TestCase
             $footer = $footers?->item(0);
             $this->assertInstanceOf(\DOMElement::class, $footer);
             $this->assertStringContainsString('GEOWorkFlow v3.0.0', $footer->textContent);
-            $this->assertStringContainsString('© 2026 Yao Jingang', $footer->textContent);
+            $this->assertStringContainsString('© 2026 Mryeehee', $footer->textContent);
             $this->assertStringContainsString('AGPL-3.0', $footer->textContent);
             $this->assertSame(1, $xpath->query('.//button[@data-open-admin-welcome]', $footer)?->length);
             $this->assertSame(
@@ -72,7 +72,6 @@ class AdminUiV3ShellTest extends TestCase
                 'https://github.com/mryeehee/GEOWorkFlow/blob/main/LICENSE',
                 'https://github.com/mryeehee/GEOWorkFlow/blob/main/docs/CHANGELOG.md',
                 'https://github.com/mryeehee/GEOWorkFlow',
-                'https://x.com/yaojingang',
                 'https://github.com/mryeehee/GEOWorkFlow/wiki',
             ];
             $links = $xpath->query('.//a', $footer);
@@ -313,7 +312,7 @@ class AdminUiV3ShellTest extends TestCase
         }
     }
 
-    public function test_community_dialog_shows_the_author_wechat_and_project_links(): void
+    public function test_community_dialog_shows_the_wechat_qr_and_project_links(): void
     {
         config()->set('geoflow.admin_ui_v3_enabled', true);
         $admin = $this->admin('community_owner', 'super_admin');
@@ -324,16 +323,16 @@ class AdminUiV3ShellTest extends TestCase
             ->assertOk()
             ->assertSee('data-dialog-open="qr"', false)
             ->assertSee('data-gf-modal="qr"', false)
-            ->assertSee(asset('assets/images/yao-jingang-wechat.jpg'), false)
+            ->assertSee(asset('assets/images/geoworkflow-wechat.jpg'), false)
             ->assertSee(__('admin.ui_v3.qr_title'))
             ->assertSee(__('admin.ui_v3.qr_invitation'))
             ->assertSee('href="https://github.com/mryeehee/GEOWorkFlow"', false)
-            ->assertSee('href="https://x.com/yaojingang"', false)
+            ->assertDontSee('https://x.com', false)
             ->assertSee('target="_blank" rel="noopener noreferrer"', false)
             ->assertDontSee('data-qr-canvas', false)
             ->assertDontSee('data-qr-value', false);
 
-        $this->assertFileExists(public_path('assets/images/yao-jingang-wechat.jpg'));
+        $this->assertFileExists(public_path('assets/images/geoworkflow-wechat.jpg'));
     }
 
     private function assertUpdateCenterLink(string $html, bool $hasUpdate): void

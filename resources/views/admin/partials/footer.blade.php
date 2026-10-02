@@ -1,6 +1,5 @@
 @php
     $projectGithubUrl = 'https://github.com/mryeehee/GEOWorkFlow';
-    $xProfileUrl = 'https://x.com/yaojingang';
     $appVersion = (string) config('geoflow.app_version', '0.0.0-dev');
     $releaseUrl = $projectGithubUrl.'/releases';
     $changelogUrl = app()->getLocale() === 'en'
@@ -17,7 +16,7 @@
         <div class="flex flex-wrap items-center gap-x-2" aria-label="GEOWorkFlow release information">
             <a href="{{ $releaseUrl }}" target="_blank" rel="noopener noreferrer" class="{{ $footerLinkClass }}">GEOWorkFlow v{{ $appVersion }}</a>
             <span class="text-gray-300" aria-hidden="true">·</span>
-            <span>© 2026 Yao Jingang</span>
+            <span>© 2026 Mryeehee</span>
             <span class="text-gray-300" aria-hidden="true">·</span>
             <a href="{{ $licenseUrl }}" target="_blank" rel="noopener noreferrer" class="{{ $footerLinkClass }}">AGPL-3.0</a>
         </div>
@@ -25,8 +24,6 @@
             <a href="{{ $changelogUrl }}" target="_blank" rel="noopener noreferrer" class="{{ $footerLinkClass }}">{{ __('admin.footer.changelog_link') }}</a>
             <span class="text-gray-300" aria-hidden="true">·</span>
             <a href="{{ $projectGithubUrl }}" target="_blank" rel="noopener noreferrer" class="{{ $footerLinkClass }}">{{ __('admin.footer.project_github_link') }}</a>
-            <span class="text-gray-300" aria-hidden="true">·</span>
-            <a href="{{ $xProfileUrl }}" target="_blank" rel="noopener noreferrer" class="{{ $footerLinkClass }}">{{ __('admin.footer.author_x_profile') }}</a>
             <span class="text-gray-300" aria-hidden="true">·</span>
             <a href="{{ $helpDocsUrl }}" target="_blank" rel="noopener noreferrer" class="{{ $footerLinkClass }}">{{ __('admin.footer.help_docs_link') }}</a>
             <span class="text-gray-300" aria-hidden="true">·</span>

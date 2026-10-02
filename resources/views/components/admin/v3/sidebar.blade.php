@@ -35,6 +35,13 @@
                     </div>
                 </section>
             @endforeach
+            <section class="gf-sidebar__group">
+                <div class="gf-sidebar__items">
+                    <button class="gf-sidebar__link" type="button" data-dialog-open="qr" title="{{ __('admin.ui_v3.sidebar_community') }}">
+                        <i data-lucide="message-circle-heart"></i><span>{{ __('admin.ui_v3.sidebar_community') }}</span>
+                    </button>
+                </div>
+            </section>
         </div>
         <section
             class="gf-sidebar__recent"

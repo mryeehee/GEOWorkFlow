@@ -77,6 +77,7 @@ return array_replace_recursive($base, [
         ],
     ],
     'ui_v3' => [
+        'sidebar_community' => 'コミュニティに参加',
         'install_workbench' => 'アプリをインストール',
         'install_workbench_label' => 'GEOWorkFlow ワークスペースをインストール',
         'recent' => '最近',
@@ -227,8 +228,6 @@ return array_replace_recursive($base, [
     ],
     'footer' => [
         'version' => 'バージョン :version',
-        'author' => '作者：Yao Jingang',
-        'author_x_profile' => '作者のXプロフィール',
         'project_github_link' => 'プロジェクト GitHub',
         'changelog_link' => '更新履歴',
         'help_docs_link' => 'ヘルプ文書',

@@ -37,7 +37,6 @@ class AdminWelcomeModalService
                 'dismissUrl' => AdminWeb::routePath('admin.welcome.dismiss'),
                 'csrfToken' => csrf_token(),
                 'links' => [
-                    'x' => 'https://x.com/yaojingang',
                     'github' => 'https://github.com/mryeehee/GEOWorkFlow',
                     'changelog' => [
                         'zh-CN' => 'https://github.com/mryeehee/GEOWorkFlow/blob/main/docs/CHANGELOG.md',
