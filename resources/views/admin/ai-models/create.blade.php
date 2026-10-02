@@ -2,22 +2,23 @@
 
 @php
     $chatPresets = [
-        ['key' => 'minimax', 'label' => 'MiniMax', 'name' => 'MiniMax M3', 'version' => 'M3', 'model_id' => 'MiniMax-M3', 'api_url' => 'https://api.minimax.io', 'model_type' => 'chat'],
-        ['key' => 'minimax_m27', 'label' => 'MiniMax M2.7', 'name' => 'MiniMax M2.7', 'version' => 'M2.7', 'model_id' => 'MiniMax-M2.7', 'api_url' => 'https://api.minimax.io', 'model_type' => 'chat'],
-        ['key' => 'minimax_highspeed', 'label' => 'MiniMax Highspeed', 'name' => 'MiniMax M2.7 Highspeed', 'version' => 'M2.7', 'model_id' => 'MiniMax-M2.7-highspeed', 'api_url' => 'https://api.minimax.io', 'model_type' => 'chat'],
-        ['key' => 'openai', 'label' => 'OpenAI', 'name' => 'GPT-5.6 Terra', 'version' => '5.6', 'model_id' => 'gpt-5.6-terra', 'api_url' => 'https://api.openai.com', 'model_type' => 'chat'],
-        ['key' => 'gemini', 'label' => 'Gemini', 'name' => 'Gemini 3.6 Flash', 'version' => 'v1beta', 'model_id' => 'gemini-3.6-flash', 'api_url' => 'https://generativelanguage.googleapis.com/v1beta', 'model_type' => 'chat'],
-        ['key' => 'deepseek', 'label' => 'DeepSeek V4 Flash', 'name' => 'DeepSeek V4 Flash', 'version' => 'v4', 'model_id' => 'deepseek-v4-flash', 'api_url' => 'https://api.deepseek.com', 'model_type' => 'chat'],
-        ['key' => 'deepseek_v4_pro', 'label' => 'DeepSeek V4 Pro', 'name' => 'DeepSeek V4 Pro', 'version' => 'v4', 'model_id' => 'deepseek-v4-pro', 'api_url' => 'https://api.deepseek.com', 'model_type' => 'chat'],
-        ['key' => 'zhipu', 'label' => 'Zhipu GLM', 'name' => '智谱 GLM-5.2', 'version' => 'v4', 'model_id' => 'glm-5.2', 'api_url' => 'https://open.bigmodel.cn/api/paas/v4', 'model_type' => 'chat'],
-        ['key' => 'volcengine_ark', 'label' => 'Volcengine Ark', 'name' => '火山方舟 Chat', 'version' => 'v3', 'model_id' => '', 'api_url' => 'https://ark.cn-beijing.volces.com/api/v3', 'model_type' => 'chat'],
+        ['key' => 'minimax', 'label' => 'MiniMax', 'name' => 'MiniMax M3', 'version' => 'M3', 'model_id' => 'MiniMax-M3', 'api_url' => 'https://api.minimax.io', 'model_type' => 'chat', 'guide' => 'minimax'],
+        ['key' => 'minimax_m27', 'label' => 'MiniMax M2.7', 'name' => 'MiniMax M2.7', 'version' => 'M2.7', 'model_id' => 'MiniMax-M2.7', 'api_url' => 'https://api.minimax.io', 'model_type' => 'chat', 'guide' => 'minimax'],
+        ['key' => 'minimax_highspeed', 'label' => 'MiniMax Highspeed', 'name' => 'MiniMax M2.7 Highspeed', 'version' => 'M2.7', 'model_id' => 'MiniMax-M2.7-highspeed', 'api_url' => 'https://api.minimax.io', 'model_type' => 'chat', 'guide' => 'minimax'],
+        ['key' => 'openai', 'label' => 'OpenAI', 'name' => 'GPT-5.6 Terra', 'version' => '5.6', 'model_id' => 'gpt-5.6-terra', 'api_url' => 'https://api.openai.com', 'model_type' => 'chat', 'guide' => 'openai'],
+        ['key' => 'gemini', 'label' => 'Gemini', 'name' => 'Gemini 3.6 Flash', 'version' => 'v1beta', 'model_id' => 'gemini-3.6-flash', 'api_url' => 'https://generativelanguage.googleapis.com/v1beta', 'model_type' => 'chat', 'guide' => 'gemini'],
+        ['key' => 'deepseek', 'label' => 'DeepSeek V4 Flash', 'name' => 'DeepSeek V4 Flash', 'version' => 'v4', 'model_id' => 'deepseek-v4-flash', 'api_url' => 'https://api.deepseek.com', 'model_type' => 'chat', 'guide' => 'deepseek'],
+        ['key' => 'deepseek_v4_pro', 'label' => 'DeepSeek V4 Pro', 'name' => 'DeepSeek V4 Pro', 'version' => 'v4', 'model_id' => 'deepseek-v4-pro', 'api_url' => 'https://api.deepseek.com', 'model_type' => 'chat', 'guide' => 'deepseek'],
+        ['key' => 'zhipu', 'label' => 'Zhipu GLM', 'name' => '智谱 GLM-5.2', 'version' => 'v4', 'model_id' => 'glm-5.2', 'api_url' => 'https://open.bigmodel.cn/api/paas/v4', 'model_type' => 'chat', 'guide' => 'zhipu'],
+        ['key' => 'volcengine_ark', 'label' => 'Volcengine Ark', 'name' => '火山方舟 Chat', 'version' => 'v3', 'model_id' => '', 'api_url' => 'https://ark.cn-beijing.volces.com/api/v3', 'model_type' => 'chat', 'guide' => 'volcengine_ark'],
     ];
     $embeddingPresets = [
-        ['key' => 'openai_embedding', 'label' => 'OpenAI Embedding', 'name' => 'OpenAI Embedding 3 Small', 'version' => '', 'model_id' => 'text-embedding-3-small', 'api_url' => 'https://api.openai.com', 'model_type' => 'embedding'],
-        ['key' => 'gemini_embedding', 'label' => 'Gemini Embedding', 'name' => 'Gemini Embedding 2', 'version' => 'v1beta', 'model_id' => 'gemini-embedding-2', 'api_url' => 'https://generativelanguage.googleapis.com/v1beta', 'model_type' => 'embedding'],
-        ['key' => 'volcengine_ark_embedding', 'label' => 'Doubao Embedding', 'name' => 'Doubao Embedding', 'version' => 'v3', 'model_id' => 'doubao-embedding-text-240515', 'api_url' => 'https://ark.cn-beijing.volces.com/api/v3', 'model_type' => 'embedding'],
-        ['key' => 'zhipu_embedding', 'label' => 'Zhipu Embedding', 'name' => '智谱 Embedding-3', 'version' => 'v4', 'model_id' => 'embedding-3', 'api_url' => 'https://open.bigmodel.cn/api/paas/v4', 'model_type' => 'embedding'],
+        ['key' => 'openai_embedding', 'label' => 'OpenAI Embedding', 'name' => 'OpenAI Embedding 3 Small', 'version' => '', 'model_id' => 'text-embedding-3-small', 'api_url' => 'https://api.openai.com', 'model_type' => 'embedding', 'guide' => 'openai'],
+        ['key' => 'gemini_embedding', 'label' => 'Gemini Embedding', 'name' => 'Gemini Embedding 2', 'version' => 'v1beta', 'model_id' => 'gemini-embedding-2', 'api_url' => 'https://generativelanguage.googleapis.com/v1beta', 'model_type' => 'embedding', 'guide' => 'gemini'],
+        ['key' => 'volcengine_ark_embedding', 'label' => 'Doubao Embedding', 'name' => 'Doubao Embedding', 'version' => 'v3', 'model_id' => 'doubao-embedding-text-240515', 'api_url' => 'https://ark.cn-beijing.volces.com/api/v3', 'model_type' => 'embedding', 'guide' => 'volcengine_ark'],
+        ['key' => 'zhipu_embedding', 'label' => 'Zhipu Embedding', 'name' => '智谱 Embedding-3', 'version' => 'v4', 'model_id' => 'embedding-3', 'api_url' => 'https://open.bigmodel.cn/api/paas/v4', 'model_type' => 'embedding', 'guide' => 'zhipu'],
     ];
+    $keyGuides = __('admin.ai_key_guides.providers');
 @endphp
 
 @section('content')
@@ -72,6 +73,7 @@
                                         data-preset-model-id="{{ $preset['model_id'] }}"
                                         data-preset-api-url="{{ $preset['api_url'] }}"
                                         data-preset-model-type="{{ $preset['model_type'] }}"
+                                        data-preset-guide="{{ json_encode($keyGuides[$preset['guide']] ?? null, JSON_UNESCAPED_UNICODE | JSON_HEX_APOS | JSON_HEX_QUOT) }}"
                                         aria-pressed="false"
                                     >
                                         {{ $preset['label'] }}
@@ -80,6 +82,19 @@
                             </div>
                         </fieldset>
                     @endforeach
+                </div>
+
+                <div class="mx-5 mb-5 hidden rounded-lg bg-blue-50 px-4 py-3 text-sm leading-6 text-blue-800 sm:mx-6" data-key-apply-guide>
+                    <div class="flex items-start gap-3">
+                        <i data-lucide="key-round" class="mt-0.5 h-4 w-4 shrink-0"></i>
+                        <div class="min-w-0">
+                            <p class="font-semibold">{{ __('admin.ai_key_guides.preset_title') }}</p>
+                            <p class="mt-1">
+                                <a href="#" target="_blank" rel="noopener noreferrer" class="font-semibold underline underline-offset-2" data-key-guide-link></a>
+                            </p>
+                            <p class="mt-1 text-xs leading-5 text-blue-700" data-key-guide-hint></p>
+                        </div>
+                    </div>
                 </div>
 
                 <div class="mx-5 mb-5 flex gap-3 rounded-lg bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-800 sm:mx-6">

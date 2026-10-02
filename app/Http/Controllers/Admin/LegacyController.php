@@ -202,7 +202,7 @@ class LegacyController extends Controller
     /**
      * 加载 AI 配置器概览统计。
      *
-     * @return array{model_count:int,prompt_count:int,total_usage:int,today_usage:int,search_provider_count:int,search_provider_today_usage:int,visibility_failed_runs:int}
+     * @return array{model_count:int,chat_model_count:int,embedding_model_count:int,prompt_count:int,total_usage:int,today_usage:int,search_provider_count:int,search_provider_today_usage:int,visibility_failed_runs:int}
      */
     private function loadAiConfiguratorStats(Admin $actor, AdminAiModelAccessResolver $modelAccess): array
     {
@@ -215,6 +215,8 @@ class LegacyController extends Controller
 
         return [
             'model_count' => (clone $configuredModels)->count(),
+            'chat_model_count' => (clone $configuredModels)->where('model_type', 'chat')->count(),
+            'embedding_model_count' => (clone $configuredModels)->where('model_type', 'embedding')->count(),
             'prompt_count' => Prompt::query()->count(),
             'total_usage' => (int) ((clone $ownedModels)->sum('total_used') ?? 0),
             'today_usage' => (int) ((clone $ownedModels)

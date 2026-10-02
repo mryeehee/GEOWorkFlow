@@ -107,6 +107,23 @@
                 @enderror
             </div>
         </div>
+
+        <details class="mt-5 rounded-lg border border-gray-200 bg-gray-50 p-4" data-api-key-guide>
+            <summary class="cursor-pointer text-sm font-semibold text-gray-900">{{ __('admin.ai_key_guides.title') }}</summary>
+            <p class="mt-1.5 text-xs leading-5 text-gray-500">{{ __('admin.ai_key_guides.hint') }}</p>
+            <ul class="mt-3 space-y-2">
+                @foreach (['volcengine_ark', 'deepseek'] as $guideKey)
+                    @php $guide = __('admin.ai_key_guides.providers')[$guideKey] ?? null; @endphp
+                    @if ($guide)
+                        <li class="text-sm leading-6 text-gray-600">
+                            <a href="{{ $guide['url'] }}" target="_blank" rel="noopener noreferrer" class="font-semibold text-blue-600 hover:text-blue-700 hover:underline">{{ $guide['label'] }}</a>
+                            <span class="text-gray-400">·</span>
+                            {{ $guide['hint'] }}
+                        </li>
+                    @endif
+                @endforeach
+            </ul>
+        </details>
     </fieldset>
 
     <fieldset class="border-t border-gray-200 pt-7">

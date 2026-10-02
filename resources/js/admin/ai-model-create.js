@@ -12,7 +12,36 @@ if (form) {
         apiKey: form.querySelector('#api_key'),
     };
     const presetButtons = Array.from(form.querySelectorAll('[data-ai-model-preset]'));
+    const guideBox = form.querySelector('[data-key-apply-guide]');
+    const guideLink = form.querySelector('[data-key-guide-link]');
+    const guideHint = form.querySelector('[data-key-guide-hint]');
     const syncMaxTokensVisibility = initializeAiModelTypeFields(form);
+
+    const hidePresetGuide = () => {
+        guideBox?.classList.add('hidden');
+    };
+
+    const showPresetGuide = (button) => {
+        if (!guideBox || !guideLink || !guideHint) return;
+
+        let guide = null;
+        try {
+            guide = JSON.parse(button.dataset.presetGuide || 'null');
+        } catch (error) {
+            guide = null;
+        }
+
+        if (!guide || !guide.url) {
+            hidePresetGuide();
+
+            return;
+        }
+
+        guideLink.href = guide.url;
+        guideLink.textContent = guide.label;
+        guideHint.textContent = guide.hint || '';
+        guideBox.classList.remove('hidden');
+    };
 
     const clearPresetSelection = () => {
         presetButtons.forEach((button) => {
@@ -20,6 +49,7 @@ if (form) {
             button.classList.remove('border-blue-500', 'bg-blue-50', 'text-blue-700', 'ring-1', 'ring-blue-200');
             button.classList.add('border-gray-300', 'bg-white', 'text-gray-700');
         });
+        hidePresetGuide();
     };
 
     presetButtons.forEach((button) => {
@@ -35,6 +65,7 @@ if (form) {
             fields.modelType.value = button.dataset.presetModelType || 'chat';
             fields.apiUrl.value = button.dataset.presetApiUrl || '';
             syncMaxTokensVisibility();
+            showPresetGuide(button);
         });
     });
 
