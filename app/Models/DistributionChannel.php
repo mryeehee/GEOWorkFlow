@@ -1,0 +1,906 @@
+<?php
+
+namespace App\Models;
+
+use App\Support\GeoFlow\CnPlatformRegistry;
+use App\Support\Site\ArticlePermalinkPolicy;
+use App\Support\Site\ArticleTextAdPicker;
+use App\Support\Site\HomepageModuleBuilder;
+use App\Support\Site\SiteSettingsBag;
+use DateTimeInterface;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
+
+class DistributionChannel extends Model
+{
+    public const TYPE_GEOFLOW_AGENT = 'geoflow_agent';
+
+    public const TYPE_HOSTED_SITE = 'hosted_site';
+
+    public const TYPE_CN_PLATFORM = 'cn_platform';
+
+    public const STATUS_ACTIVE = 'active';
+
+    public const STATUS_PAUSED = 'paused';
+
+    public const STATUS_DELETING = 'deleting';
+
+    public const MAX_CUSTOM_TEXT_AD_MODULES_PER_PLACEMENT = 5;
+
+    public const FRONTEND_EXPERIENCE_CUSTOM = 'custom';
+
+    public const FRONTEND_EXPERIENCE_INHERIT_DEFAULT = 'inherit_default';
+
+    public const FRONTEND_EXPERIENCE_SNAPSHOT_DEFAULT = 'snapshot_default';
+
+    public const FRONTEND_EXPERIENCE_MODES = [
+        self::FRONTEND_EXPERIENCE_CUSTOM,
+        self::FRONTEND_EXPERIENCE_INHERIT_DEFAULT,
+        self::FRONTEND_EXPERIENCE_SNAPSHOT_DEFAULT,
+    ];
+
+    public const FRONTEND_CAPABILITIES_CACHE_KEY = 'frontend_capabilities_cache';
+
+    public const FRONTEND_CAPABILITIES_CACHE_STATUSES = [
+        'not_checked',
+        'ok',
+        'missing_secret',
+        'unsupported_or_not_found',
+        'unavailable',
+        'not_applicable',
+    ];
+
+    protected $fillable = [
+        'name',
+        'domain',
+        'endpoint_url',
+        'channel_type',
+        'front_mode',
+        'template_key',
+        'site_settings',
+        'channel_config',
+        'status',
+        'description',
+        'last_health_status',
+        'last_health_checked_at',
+        'last_error_message',
+        'created_by_admin_id',
+    ];
+
+    protected function casts(): array
+    {
+        return [
+            'created_by_admin_id' => 'integer',
+            'last_health_checked_at' => 'datetime',
+            'site_settings' => 'array',
+            'channel_config' => 'array',
+        ];
+    }
+
+    /**
+     * @return array{
+     *   site_name:string,
+     *   site_subtitle:string,
+     *   site_description:string,
+     *   site_keywords:string,
+     *   copyright_info:string,
+     *   site_logo:string,
+     *   site_favicon:string,
+     *   seo_title_template:string,
+     *   seo_description_template:string,
+     *   featured_limit:int,
+     *   per_page:int,
+     *   homepage_style:array<string,string>,
+     *   homepage_modules:list<array<string,mixed>>,
+     *   home_carousel_slides:list<array<string,mixed>>
+     * }
+     */
+    public function resolvedSiteSettings(): array
+    {
+        $stored = is_array($this->site_settings) ? $this->site_settings : [];
+        $rawSiteName = $stored['site_name'] ?? $this->name ?? 'GEOWorkFlow Target Site';
+        $siteName = trim((string) $rawSiteName);
+
+        return [
+            'site_name' => $siteName !== '' ? $siteName : 'GEOWorkFlow Target Site',
+            'site_subtitle' => trim((string) ($stored['site_subtitle'] ?? '')),
+            'site_description' => trim((string) ($stored['site_description'] ?? '由 GEOWorkFlow 自动分发和管理的目标站点。')),
+            'site_keywords' => trim((string) ($stored['site_keywords'] ?? '')),
+            'copyright_info' => trim((string) ($stored['copyright_info'] ?? '© '.date('Y').' '.($siteName !== '' ? $siteName : 'GEOWorkFlow Target Site'))),
+            'site_logo' => trim((string) ($stored['site_logo'] ?? '')),
+            'site_favicon' => trim((string) ($stored['site_favicon'] ?? '')),
+            'seo_title_template' => trim((string) ($stored['seo_title_template'] ?? '{title} - {site_name}')),
+            'seo_description_template' => trim((string) ($stored['seo_description_template'] ?? '{description}')),
+            'featured_limit' => min(100, max(1, (int) ($stored['featured_limit'] ?? 6))),
+            'per_page' => min(200, max(1, (int) ($stored['per_page'] ?? 12))),
+            'article_permalink_policy' => ArticlePermalinkPolicy::fromRaw(
+                $stored[ArticlePermalinkPolicy::SETTING_KEY] ?? null
+            )->toArray(),
+        ] + $this->resolvedFrontendExperienceSettings();
+    }
+
+    /**
+     * @return array<string,mixed>
+     */
+    public function targetSiteSettingsPayload(): array
+    {
+        return $this->resolvedSiteSettings() + [
+            'active_theme' => (string) ($this->template_key ?? ''),
+            'front_mode' => $this->frontMode(),
+            'frontend_experience_mode' => $this->frontendExperienceMode(),
+            'article_text_ads' => $this->effectiveArticleTextAds(),
+        ];
+    }
+
+    public function frontendExperienceMode(): string
+    {
+        $stored = is_array($this->channel_config) ? $this->channel_config : [];
+
+        return self::normalizeFrontendExperienceMode($stored['frontend_experience_mode'] ?? null);
+    }
+
+    public function hostedSiteProfile(): HasOne
+    {
+        return $this->hasOne(HostedSiteProfile::class);
+    }
+
+    /**
+     * @return array{
+     *   status:string,
+     *   checked_at:string,
+     *   message:string,
+     *   reachable:bool,
+     *   package_version:string,
+     *   capability_version:string,
+     *   active_theme:string,
+     *   front_mode:string,
+     *   frontend_experience_mode:string,
+     *   supported_modules:list<string>,
+     *   supported_routes:list<string>,
+     *   supports_homepage_style:bool,
+     *   supports_home_carousel_slides:bool,
+     *   supports_article_text_ads:bool,
+     *   supports_article_permalink_policy:bool,
+     *   article_permalink_schema_versions:list<int>,
+     *   current_article_permalink_revision:int,
+     *   current_article_permalink_pattern:string,
+     *   supports_static_generation:bool,
+     *   agent_base_url:string
+     * }
+     */
+    public function frontendCapabilitiesCache(): array
+    {
+        $stored = is_array($this->channel_config) ? $this->channel_config : [];
+
+        return self::normalizeFrontendCapabilitiesCache($stored[self::FRONTEND_CAPABILITIES_CACHE_KEY] ?? null);
+    }
+
+    /**
+     * @param  array<string,mixed>  $cache
+     */
+    public function fillFrontendCapabilitiesCache(array $cache): self
+    {
+        $config = is_array($this->channel_config) ? $this->channel_config : [];
+        $config[self::FRONTEND_CAPABILITIES_CACHE_KEY] = self::normalizeFrontendCapabilitiesCache($cache);
+
+        return $this->forceFill(['channel_config' => $config]);
+    }
+
+    /**
+     * @return array{
+     *   status:string,
+     *   checked_at:string,
+     *   message:string,
+     *   reachable:bool,
+     *   package_version:string,
+     *   capability_version:string,
+     *   active_theme:string,
+     *   front_mode:string,
+     *   frontend_experience_mode:string,
+     *   supported_modules:list<string>,
+     *   supported_routes:list<string>,
+     *   supports_homepage_style:bool,
+     *   supports_home_carousel_slides:bool,
+     *   supports_article_text_ads:bool,
+     *   supports_article_permalink_policy:bool,
+     *   article_permalink_schema_versions:list<int>,
+     *   current_article_permalink_revision:int,
+     *   current_article_permalink_pattern:string,
+     *   supports_static_generation:bool,
+     *   agent_base_url:string
+     * }
+     */
+    public static function normalizeFrontendCapabilitiesCache(mixed $cache): array
+    {
+        $default = [
+            'status' => 'not_checked',
+            'checked_at' => '',
+            'message' => '尚未检查远端前台能力。',
+            'reachable' => false,
+            'package_version' => '',
+            'capability_version' => '',
+            'active_theme' => '',
+            'front_mode' => '',
+            'frontend_experience_mode' => '',
+            'supported_modules' => [],
+            'supported_routes' => [],
+            'supports_homepage_style' => false,
+            'supports_home_carousel_slides' => false,
+            'supports_article_text_ads' => false,
+            'supports_article_permalink_policy' => false,
+            'article_permalink_schema_versions' => [],
+            'current_article_permalink_revision' => 0,
+            'current_article_permalink_pattern' => '',
+            'supports_static_generation' => false,
+            'agent_base_url' => '',
+        ];
+
+        if (! is_array($cache)) {
+            return $default;
+        }
+
+        $status = trim((string) ($cache['status'] ?? 'not_checked'));
+        if (! in_array($status, self::FRONTEND_CAPABILITIES_CACHE_STATUSES, true)) {
+            $status = 'unavailable';
+        }
+
+        $checkedAt = $cache['checked_at'] ?? '';
+        if ($checkedAt instanceof DateTimeInterface) {
+            $checkedAt = $checkedAt->format(DATE_ATOM);
+        } else {
+            $checkedAt = trim((string) $checkedAt);
+        }
+
+        return [
+            'status' => $status,
+            'checked_at' => $checkedAt,
+            'message' => trim((string) ($cache['message'] ?? $default['message'])),
+            'reachable' => (bool) ($cache['reachable'] ?? false),
+            'package_version' => trim((string) ($cache['package_version'] ?? '')),
+            'capability_version' => trim((string) ($cache['capability_version'] ?? '')),
+            'active_theme' => trim((string) ($cache['active_theme'] ?? '')),
+            'front_mode' => trim((string) ($cache['front_mode'] ?? '')),
+            'frontend_experience_mode' => trim((string) ($cache['frontend_experience_mode'] ?? '')),
+            'supported_modules' => self::normalizeFrontendCapabilityStrings($cache['supported_modules'] ?? []),
+            'supported_routes' => self::normalizeFrontendCapabilityStrings($cache['supported_routes'] ?? []),
+            'supports_homepage_style' => (bool) ($cache['supports_homepage_style'] ?? false),
+            'supports_home_carousel_slides' => (bool) ($cache['supports_home_carousel_slides'] ?? false),
+            'supports_article_text_ads' => (bool) ($cache['supports_article_text_ads'] ?? false),
+            'supports_article_permalink_policy' => (bool) ($cache['supports_article_permalink_policy'] ?? false),
+            'article_permalink_schema_versions' => array_values(array_unique(array_map(
+                'intval',
+                is_array($cache['article_permalink_schema_versions'] ?? null) ? $cache['article_permalink_schema_versions'] : [],
+            ))),
+            'current_article_permalink_revision' => max(0, (int) ($cache['current_article_permalink_revision'] ?? 0)),
+            'current_article_permalink_pattern' => trim((string) ($cache['current_article_permalink_pattern'] ?? '')),
+            'supports_static_generation' => (bool) ($cache['supports_static_generation'] ?? false),
+            'agent_base_url' => trim((string) ($cache['agent_base_url'] ?? '')),
+        ];
+    }
+
+    /**
+     * @return list<string>
+     */
+    private static function normalizeFrontendCapabilityStrings(mixed $values): array
+    {
+        if (! is_array($values)) {
+            return [];
+        }
+
+        $normalized = [];
+        foreach ($values as $value) {
+            $value = trim((string) $value);
+            if ($value === '' || in_array($value, $normalized, true)) {
+                continue;
+            }
+
+            $normalized[] = $value;
+        }
+
+        return $normalized;
+    }
+
+    /**
+     * @return list<string>
+     */
+    public static function frontendExperienceModes(): array
+    {
+        return self::FRONTEND_EXPERIENCE_MODES;
+    }
+
+    public static function normalizeFrontendExperienceMode(mixed $mode): string
+    {
+        $mode = trim((string) ($mode ?? self::FRONTEND_EXPERIENCE_CUSTOM));
+
+        return in_array($mode, self::FRONTEND_EXPERIENCE_MODES, true)
+            ? $mode
+            : self::FRONTEND_EXPERIENCE_CUSTOM;
+    }
+
+    /**
+     * @return array{
+     *   homepage_style:array<string,string>,
+     *   homepage_modules:list<array<string,mixed>>,
+     *   home_carousel_slides:list<array<string,mixed>>
+     * }
+     */
+    public function resolvedFrontendExperienceSettings(): array
+    {
+        if ($this->frontendExperienceMode() === self::FRONTEND_EXPERIENCE_INHERIT_DEFAULT) {
+            return self::defaultFrontendExperienceSettings();
+        }
+
+        $stored = is_array($this->site_settings) ? $this->site_settings : [];
+        $defaults = self::defaultFrontendExperienceSettings();
+
+        return [
+            'homepage_style' => self::normalizeHomepageStyle($stored['homepage_style'] ?? $defaults['homepage_style']),
+            'homepage_modules' => self::normalizeHomepageModules($stored['homepage_modules'] ?? $defaults['homepage_modules']),
+            'home_carousel_slides' => self::normalizeHomeCarouselSlides($stored['home_carousel_slides'] ?? $defaults['home_carousel_slides']),
+        ];
+    }
+
+    /**
+     * @return array{
+     *   homepage_style:array<string,string>,
+     *   homepage_modules:list<array<string,mixed>>,
+     *   home_carousel_slides:list<array<string,mixed>>
+     * }
+     */
+    public static function defaultFrontendExperienceSettings(): array
+    {
+        $settings = SiteSettingsBag::all();
+
+        return [
+            'homepage_style' => HomepageModuleBuilder::styleFromRaw((string) ($settings['homepage_style'] ?? '{}')),
+            'homepage_modules' => HomepageModuleBuilder::fromRaw((string) ($settings['homepage_modules'] ?? '[]'), false),
+            'home_carousel_slides' => self::normalizeHomeCarouselSlides(self::decodeJsonSetting($settings['home_carousel_slides'] ?? [], [])),
+        ];
+    }
+
+    /**
+     * @return array<string,string>
+     */
+    public static function normalizeHomepageStyle(mixed $style): array
+    {
+        if (is_string($style)) {
+            return HomepageModuleBuilder::styleFromRaw($style);
+        }
+
+        return HomepageModuleBuilder::normalizeStyle(is_array($style) ? $style : []);
+    }
+
+    /**
+     * @return list<array<string,mixed>>
+     */
+    public static function normalizeHomepageModules(mixed $modules): array
+    {
+        if (is_string($modules)) {
+            return HomepageModuleBuilder::fromRaw($modules, false);
+        }
+
+        return HomepageModuleBuilder::normalizeModules(is_array($modules) ? $modules : [], false, HomepageModuleBuilder::MAX_MODULES);
+    }
+
+    /**
+     * @return list<array{image_url:string,title:string,link_url:string,enabled:bool}>
+     */
+    public static function normalizeHomeCarouselSlides(mixed $slides): array
+    {
+        if (is_string($slides)) {
+            $slides = self::decodeJsonSetting($slides, []);
+        }
+        if (! is_array($slides)) {
+            return [];
+        }
+
+        $normalized = [];
+        foreach ($slides as $slide) {
+            if (! is_array($slide)) {
+                continue;
+            }
+
+            $imageUrl = HomepageModuleBuilder::normalizeUrl((string) ($slide['image_url'] ?? ''), true);
+            $title = mb_substr(trim((string) ($slide['title'] ?? '')), 0, 120);
+            $linkUrl = HomepageModuleBuilder::normalizeUrl((string) ($slide['link_url'] ?? ''), true);
+            if ($imageUrl === '' && $title === '' && $linkUrl === '') {
+                continue;
+            }
+            if ($imageUrl === '') {
+                continue;
+            }
+
+            $normalized[] = [
+                'image_url' => $imageUrl,
+                'title' => $title,
+                'link_url' => $linkUrl,
+                'enabled' => ! empty($slide['enabled']),
+            ];
+
+            if (count($normalized) >= 3) {
+                break;
+            }
+        }
+
+        return $normalized;
+    }
+
+    private static function decodeJsonSetting(mixed $value, mixed $fallback): mixed
+    {
+        if (! is_string($value)) {
+            return $value;
+        }
+
+        $decoded = json_decode($value, true);
+
+        return json_last_error() === JSON_ERROR_NONE ? $decoded : $fallback;
+    }
+
+    public function frontMode(): string
+    {
+        $mode = (string) ($this->front_mode ?? 'static');
+
+        return in_array($mode, ['static', 'rewrite'], true) ? $mode : 'static';
+    }
+
+    public function usesStaticFront(): bool
+    {
+        return $this->frontMode() === 'static';
+    }
+
+    public function channelType(): string
+    {
+        $type = (string) ($this->channel_type ?? 'geoflow_agent');
+
+        return in_array($type, ['geoflow_agent', 'wordpress_rest', 'generic_http_api', self::TYPE_CN_PLATFORM, self::TYPE_HOSTED_SITE], true) ? $type : 'geoflow_agent';
+    }
+
+    public function isGeoFlowAgent(): bool
+    {
+        return $this->channelType() === 'geoflow_agent';
+    }
+
+    public function isWordPressRest(): bool
+    {
+        return $this->channelType() === 'wordpress_rest';
+    }
+
+    public function isGenericHttpApi(): bool
+    {
+        return $this->channelType() === 'generic_http_api';
+    }
+
+    public function isHostedSite(): bool
+    {
+        return $this->channelType() === self::TYPE_HOSTED_SITE;
+    }
+
+    public function isCnPlatform(): bool
+    {
+        return $this->channelType() === self::TYPE_CN_PLATFORM;
+    }
+
+    public function isCnPlatformBrowserAssist(): bool
+    {
+        return $this->isCnPlatform()
+            && CnPlatformRegistry::isBrowserAssistMode($this->resolvedCnPlatformConfig()['cn_auth_mode']);
+    }
+
+    /**
+     * @return array{
+     *   cn_platform:string,
+     *   cn_auth_mode:string,
+     *   cn_post_status:string,
+     *   cn_append_source_link:bool,
+     *   cn_title_limit:int,
+     *   cn_summary_limit:int,
+     *   cn_api_base:string,
+     *   cn_api_publish_url:string,
+     *   cn_api_update_url:string,
+     *   cn_api_method:string,
+     *   cn_api_auth_style:string,
+     *   cn_api_auth_header:string,
+     *   cn_api_title_field:string,
+     *   cn_api_content_field:string,
+     *   cn_api_url_field:string,
+     *   cn_api_remote_id_path:string,
+     *   cn_api_remote_url_path:string,
+     *   cn_content_format:string,
+     *   cn_write_url:string,
+     *   cn_image_strategy:string
+     * }
+     */
+    public function resolvedCnPlatformConfig(): array
+    {
+        $stored = is_array($this->channel_config) ? $this->channel_config : [];
+        $platform = trim((string) ($stored['cn_platform'] ?? ''));
+        if (! CnPlatformRegistry::exists($platform)) {
+            $platform = 'zhihu';
+        }
+        $preset = CnPlatformRegistry::get($platform) ?? [];
+
+        $mode = trim((string) ($stored['cn_auth_mode'] ?? ''));
+        if (! CnPlatformRegistry::supportsMode($platform, $mode)) {
+            $mode = (array_key_first($preset['modes'] ?? []) !== null)
+                ? (string) ($preset['modes'][0] ?? CnPlatformRegistry::AUTH_BROWSER_ASSIST)
+                : CnPlatformRegistry::AUTH_BROWSER_ASSIST;
+        }
+
+        $postStatus = (string) ($stored['cn_post_status'] ?? 'draft');
+        $authStyle = (string) ($stored['cn_api_auth_style'] ?? 'header_bearer');
+        $contentFormat = (string) ($stored['cn_content_format'] ?? 'html');
+        $imageStrategy = (string) ($stored['cn_image_strategy'] ?? 'keep_original');
+
+        return [
+            'cn_platform' => $platform,
+            'cn_auth_mode' => $mode,
+            'cn_post_status' => in_array($postStatus, ['draft', 'publish'], true) ? $postStatus : 'draft',
+            'cn_append_source_link' => (bool) ($stored['cn_append_source_link'] ?? true),
+            'cn_title_limit' => min(200, max(10, (int) ($stored['cn_title_limit'] ?? CnPlatformRegistry::defaultTitleLimit($platform)))),
+            'cn_summary_limit' => min(1000, max(20, (int) ($stored['cn_summary_limit'] ?? CnPlatformRegistry::defaultSummaryLimit($platform)))),
+            'cn_api_base' => rtrim(trim((string) ($stored['cn_api_base'] ?? (string) ($preset['api_base'] ?? ''))), '/'),
+            'cn_api_publish_url' => trim((string) ($stored['cn_api_publish_url'] ?? '')),
+            'cn_api_update_url' => trim((string) ($stored['cn_api_update_url'] ?? '')),
+            'cn_api_method' => in_array(strtoupper(trim((string) ($stored['cn_api_method'] ?? 'POST'))), ['POST', 'PUT', 'PATCH'], true)
+                ? strtoupper(trim((string) ($stored['cn_api_method'] ?? 'POST')))
+                : 'POST',
+            'cn_api_auth_style' => in_array($authStyle, ['header_bearer', 'header_key', 'query_token'], true) ? $authStyle : 'header_bearer',
+            'cn_api_auth_header' => trim((string) ($stored['cn_api_auth_header'] ?? 'X-API-Key')) ?: 'X-API-Key',
+            'cn_api_title_field' => trim((string) ($stored['cn_api_title_field'] ?? 'title')) ?: 'title',
+            'cn_api_content_field' => trim((string) ($stored['cn_api_content_field'] ?? 'content')) ?: 'content',
+            'cn_api_url_field' => trim((string) ($stored['cn_api_url_field'] ?? 'source_url')) ?: 'source_url',
+            'cn_api_remote_id_path' => trim((string) ($stored['cn_api_remote_id_path'] ?? 'id')) ?: 'id',
+            'cn_api_remote_url_path' => trim((string) ($stored['cn_api_remote_url_path'] ?? 'url')) ?: 'url',
+            'cn_content_format' => in_array($contentFormat, ['html', 'markdown', 'text'], true) ? $contentFormat : 'html',
+            'cn_write_url' => trim((string) ($stored['cn_write_url'] ?? (string) ($preset['write_url'] ?? ''))),
+            'cn_image_strategy' => in_array($imageStrategy, ['keep_original', 'omit'], true) ? $imageStrategy : 'keep_original',
+        ];
+    }
+
+    /**
+     * @return array{
+     *   wordpress_username:string,
+     *   wordpress_post_status:string,
+     *   wordpress_category_strategy:string,
+     *   wordpress_fixed_category:string,
+     *   wordpress_tag_strategy:string,
+     *   wordpress_image_strategy:string,
+     *   wordpress_content_format:string
+     * }
+     */
+    public function resolvedChannelConfig(): array
+    {
+        $stored = is_array($this->channel_config) ? $this->channel_config : [];
+        $postStatus = (string) ($stored['wordpress_post_status'] ?? 'publish');
+        $categoryStrategy = (string) ($stored['wordpress_category_strategy'] ?? 'match_or_create');
+        $tagStrategy = (string) ($stored['wordpress_tag_strategy'] ?? 'keywords_to_tags');
+        $imageStrategy = (string) ($stored['wordpress_image_strategy'] ?? 'upload_to_media');
+
+        return [
+            'wordpress_username' => trim((string) ($stored['wordpress_username'] ?? '')),
+            'wordpress_post_status' => in_array($postStatus, ['publish', 'draft', 'pending', 'private'], true) ? $postStatus : 'publish',
+            'wordpress_category_strategy' => in_array($categoryStrategy, ['match_or_create', 'match_only', 'fixed'], true) ? $categoryStrategy : 'match_or_create',
+            'wordpress_fixed_category' => trim((string) ($stored['wordpress_fixed_category'] ?? '')),
+            'wordpress_tag_strategy' => in_array($tagStrategy, ['keywords_to_tags', 'disabled'], true) ? $tagStrategy : 'keywords_to_tags',
+            'wordpress_image_strategy' => in_array($imageStrategy, ['upload_to_media', 'keep_original'], true) ? $imageStrategy : 'upload_to_media',
+            'wordpress_content_format' => 'html',
+        ];
+    }
+
+    /**
+     * @return array{
+     *   generic_auth_type:string,
+     *   generic_basic_username:string,
+     *   generic_header_name:string,
+     *   generic_hmac_key_id_header:string,
+     *   generic_hmac_signature_header:string,
+     *   generic_hmac_timestamp_header:string,
+     *   generic_hmac_nonce_header:string,
+     *   generic_hmac_body_hash_header:string,
+     *   generic_timeout_seconds:int,
+     *   generic_success_statuses:list<int>,
+     *   generic_health_method:string,
+     *   generic_health_path:string,
+     *   generic_publish_method:string,
+     *   generic_publish_path:string,
+     *   generic_update_method:string,
+     *   generic_update_path:string,
+     *   generic_delete_method:string,
+     *   generic_delete_path:string,
+     *   generic_settings_method:string,
+     *   generic_settings_path:string,
+     *   generic_remote_id_path:string,
+     *   generic_remote_url_path:string,
+     *   generic_payload_wrapper:string
+     * }
+     */
+    public function resolvedGenericHttpConfig(): array
+    {
+        $stored = is_array($this->channel_config) ? $this->channel_config : [];
+        $authType = (string) ($stored['generic_auth_type'] ?? 'bearer');
+        $payloadWrapper = (string) ($stored['generic_payload_wrapper'] ?? 'none');
+
+        return [
+            'generic_auth_type' => in_array($authType, ['none', 'bearer', 'basic', 'header_key', 'hmac'], true) ? $authType : 'bearer',
+            'generic_basic_username' => trim((string) ($stored['generic_basic_username'] ?? '')),
+            'generic_header_name' => trim((string) ($stored['generic_header_name'] ?? 'X-API-Key')) ?: 'X-API-Key',
+            'generic_hmac_key_id_header' => trim((string) ($stored['generic_hmac_key_id_header'] ?? 'X-GEOFlow-Key-Id')) ?: 'X-GEOFlow-Key-Id',
+            'generic_hmac_signature_header' => trim((string) ($stored['generic_hmac_signature_header'] ?? 'X-GEOFlow-Signature')) ?: 'X-GEOFlow-Signature',
+            'generic_hmac_timestamp_header' => trim((string) ($stored['generic_hmac_timestamp_header'] ?? 'X-GEOFlow-Timestamp')) ?: 'X-GEOFlow-Timestamp',
+            'generic_hmac_nonce_header' => trim((string) ($stored['generic_hmac_nonce_header'] ?? 'X-GEOFlow-Nonce')) ?: 'X-GEOFlow-Nonce',
+            'generic_hmac_body_hash_header' => trim((string) ($stored['generic_hmac_body_hash_header'] ?? 'X-GEOFlow-Body-SHA256')) ?: 'X-GEOFlow-Body-SHA256',
+            'generic_timeout_seconds' => min(120, max(5, (int) ($stored['generic_timeout_seconds'] ?? 30))),
+            'generic_success_statuses' => $this->genericSuccessStatuses($stored['generic_success_statuses'] ?? [200, 201, 202, 204]),
+            'generic_health_method' => $this->genericHttpMethod($stored['generic_health_method'] ?? 'GET', ['GET', 'POST'], 'GET'),
+            'generic_health_path' => $this->genericPath($stored['generic_health_path'] ?? '/health'),
+            'generic_publish_method' => $this->genericHttpMethod($stored['generic_publish_method'] ?? 'POST', ['POST', 'PUT', 'PATCH'], 'POST'),
+            'generic_publish_path' => $this->genericPath($stored['generic_publish_path'] ?? '/articles'),
+            'generic_update_method' => $this->genericHttpMethod($stored['generic_update_method'] ?? 'POST', ['POST', 'PUT', 'PATCH'], 'POST'),
+            'generic_update_path' => $this->genericPath($stored['generic_update_path'] ?? '/articles/{remote_id}'),
+            'generic_delete_method' => $this->genericHttpMethod($stored['generic_delete_method'] ?? 'DELETE', ['DELETE', 'POST'], 'DELETE'),
+            'generic_delete_path' => $this->genericPath($stored['generic_delete_path'] ?? '/articles/{remote_id}'),
+            'generic_settings_method' => $this->genericHttpMethod($stored['generic_settings_method'] ?? 'POST', ['POST', 'PUT', 'PATCH'], 'POST'),
+            'generic_settings_path' => $this->genericPath($stored['generic_settings_path'] ?? ''),
+            'generic_remote_id_path' => trim((string) ($stored['generic_remote_id_path'] ?? 'id')),
+            'generic_remote_url_path' => trim((string) ($stored['generic_remote_url_path'] ?? 'url')),
+            'generic_payload_wrapper' => in_array($payloadWrapper, ['none', 'data'], true) ? $payloadWrapper : 'none',
+        ];
+    }
+
+    /**
+     * @return array{
+     *   content_top:array{mode:string,module_ids:list<string>,ad_ids:list<string>,custom_modules:list<array<string,mixed>>},
+     *   content_bottom:array{mode:string,module_ids:list<string>,ad_ids:list<string>,custom_modules:list<array<string,mixed>>}
+     * }
+     */
+    public function resolvedArticleTextAdPolicy(): array
+    {
+        $stored = is_array($this->channel_config) ? $this->channel_config : [];
+
+        return self::normalizeArticleTextAdPolicy($stored['article_text_ad_policy'] ?? null);
+    }
+
+    /**
+     * @return array<int, array<string,mixed>>
+     */
+    public function effectiveArticleTextAds(): array
+    {
+        $policy = $this->resolvedArticleTextAdPolicy();
+        $globalModules = ArticleTextAdPicker::all(true);
+        $effectiveModules = [];
+
+        foreach (ArticleTextAdPicker::PLACEMENTS as $placement) {
+            $placementPolicy = $policy[$placement] ?? self::defaultArticleTextAdPolicyForPlacement();
+            $mode = (string) ($placementPolicy['mode'] ?? 'inherit');
+            if ($mode === 'disabled') {
+                continue;
+            }
+
+            if ($mode === 'custom') {
+                $effectiveModules = array_merge(
+                    $effectiveModules,
+                    ArticleTextAdPicker::normalizeModules(
+                        $placementPolicy['custom_modules'] ?? [],
+                        true,
+                        self::MAX_CUSTOM_TEXT_AD_MODULES_PER_PLACEMENT
+                    )
+                );
+
+                continue;
+            }
+
+            $modulesForPlacement = array_values(array_filter(
+                $globalModules,
+                static fn (array $module): bool => ($module['placement'] ?? '') === $placement
+            ));
+
+            if ($mode === 'selected') {
+                $selectedModuleIds = $placementPolicy['module_ids'] ?? [];
+                $legacyAdIds = $placementPolicy['ad_ids'] ?? [];
+                $selectedIds = $selectedModuleIds !== [] ? $selectedModuleIds : $legacyAdIds;
+                $modulesForPlacement = array_values(array_filter(
+                    $modulesForPlacement,
+                    static fn (array $module): bool => ArticleTextAdPicker::moduleOrLinkMatchesIds($module, $selectedIds)
+                ));
+            }
+
+            $effectiveModules = array_merge($effectiveModules, $modulesForPlacement);
+        }
+
+        return array_values($effectiveModules);
+    }
+
+    /**
+     * @return array{
+     *   content_top:array{mode:string,module_ids:list<string>,ad_ids:list<string>,custom_modules:list<array<string,mixed>>},
+     *   content_bottom:array{mode:string,module_ids:list<string>,ad_ids:list<string>,custom_modules:list<array<string,mixed>>}
+     * }
+     */
+    public static function normalizeArticleTextAdPolicy(mixed $policy): array
+    {
+        $default = [
+            'content_top' => self::defaultArticleTextAdPolicyForPlacement(),
+            'content_bottom' => self::defaultArticleTextAdPolicyForPlacement(),
+        ];
+
+        if (is_string($policy)) {
+            $mode = self::normalizeArticleTextAdMode($policy);
+
+            return [
+                'content_top' => self::defaultArticleTextAdPolicyForPlacement($mode),
+                'content_bottom' => self::defaultArticleTextAdPolicyForPlacement($mode),
+            ];
+        }
+
+        if (! is_array($policy)) {
+            return $default;
+        }
+
+        if (array_key_exists('mode', $policy)) {
+            $mode = self::normalizeArticleTextAdMode((string) ($policy['mode'] ?? 'inherit'));
+            $moduleIds = self::normalizeArticleTextAdIds($policy['module_ids'] ?? []);
+            $adIds = self::normalizeArticleTextAdIds($policy['ad_ids'] ?? []);
+            $customModules = ArticleTextAdPicker::normalizeModules(
+                $policy['custom_modules'] ?? [],
+                false,
+                self::MAX_CUSTOM_TEXT_AD_MODULES_PER_PLACEMENT
+            );
+
+            return [
+                'content_top' => self::defaultArticleTextAdPolicyForPlacement($mode, $moduleIds, $adIds, $customModules),
+                'content_bottom' => self::defaultArticleTextAdPolicyForPlacement($mode, $moduleIds, $adIds, $customModules),
+            ];
+        }
+
+        foreach (ArticleTextAdPicker::PLACEMENTS as $placement) {
+            $placementPolicy = is_array($policy[$placement] ?? null) ? $policy[$placement] : [];
+            $default[$placement] = self::defaultArticleTextAdPolicyForPlacement(
+                self::normalizeArticleTextAdMode((string) ($placementPolicy['mode'] ?? 'inherit')),
+                self::normalizeArticleTextAdIds($placementPolicy['module_ids'] ?? []),
+                self::normalizeArticleTextAdIds($placementPolicy['ad_ids'] ?? []),
+                self::normalizeCustomArticleTextAdModules($placementPolicy['custom_modules'] ?? [], $placement)
+            );
+        }
+
+        return $default;
+    }
+
+    /**
+     * @param  list<string>  $moduleIds
+     * @param  list<string>  $adIds
+     * @param  list<array<string,mixed>>  $customModules
+     * @return array{mode:string,module_ids:list<string>,ad_ids:list<string>,custom_modules:list<array<string,mixed>>}
+     */
+    private static function defaultArticleTextAdPolicyForPlacement(
+        string $mode = 'inherit',
+        array $moduleIds = [],
+        array $adIds = [],
+        array $customModules = []
+    ): array {
+        return [
+            'mode' => self::normalizeArticleTextAdMode($mode),
+            'module_ids' => array_values($moduleIds),
+            'ad_ids' => array_values($adIds),
+            'custom_modules' => array_values($customModules),
+        ];
+    }
+
+    private static function normalizeArticleTextAdMode(string $mode): string
+    {
+        return in_array($mode, ['inherit', 'disabled', 'selected', 'custom'], true) ? $mode : 'inherit';
+    }
+
+    /**
+     * @return list<array<string,mixed>>
+     */
+    private static function normalizeCustomArticleTextAdModules(mixed $modules, string $placement): array
+    {
+        $normalized = ArticleTextAdPicker::normalizeModules($modules, false, self::MAX_CUSTOM_TEXT_AD_MODULES_PER_PLACEMENT);
+
+        return array_values(array_filter(
+            $normalized,
+            static fn (array $module): bool => ($module['placement'] ?? '') === $placement
+        ));
+    }
+
+    /**
+     * @return list<string>
+     */
+    private static function normalizeArticleTextAdIds(mixed $adIds): array
+    {
+        if (! is_array($adIds)) {
+            return [];
+        }
+
+        $normalized = [];
+        foreach ($adIds as $adId) {
+            $value = trim((string) $adId);
+            if ($value === '' || mb_strlen($value) > 120 || in_array($value, $normalized, true)) {
+                continue;
+            }
+            $normalized[] = $value;
+        }
+
+        return $normalized;
+    }
+
+    /**
+     * @return list<int>
+     */
+    private function genericSuccessStatuses(mixed $value): array
+    {
+        $items = is_array($value) ? $value : explode(',', (string) $value);
+        $statuses = [];
+        foreach ($items as $item) {
+            $status = (int) $item;
+            if ($status >= 100 && $status <= 599 && ! in_array($status, $statuses, true)) {
+                $statuses[] = $status;
+            }
+        }
+
+        return $statuses !== [] ? $statuses : [200, 201, 202, 204];
+    }
+
+    /**
+     * @param  list<string>  $allowed
+     */
+    private function genericHttpMethod(mixed $method, array $allowed, string $default): string
+    {
+        $method = strtoupper(trim((string) $method));
+
+        return in_array($method, $allowed, true) ? $method : $default;
+    }
+
+    private function genericPath(mixed $path): string
+    {
+        $path = trim((string) $path);
+        if ($path === '') {
+            return '';
+        }
+
+        return str_starts_with($path, '/') ? $path : '/'.$path;
+    }
+
+    public function wordpressRestBaseUrl(): string
+    {
+        $base = rtrim((string) $this->endpoint_url, '/');
+
+        return str_ends_with($base, '/wp-json') ? $base : $base.'/wp-json';
+    }
+
+    public function secrets(): HasMany
+    {
+        return $this->hasMany(DistributionChannelSecret::class);
+    }
+
+    public function activeSecret(): HasOne
+    {
+        return $this->hasOne(DistributionChannelSecret::class)
+            ->where('status', 'active')
+            ->latestOfMany();
+    }
+
+    public function tasks(): BelongsToMany
+    {
+        return $this->belongsToMany(Task::class, 'task_distribution_channels')
+            ->withPivot(['trigger', 'remote_status', 'failure_policy', 'max_attempts', 'sort_order'])
+            ->withTimestamps();
+    }
+
+    public function articleDistributions(): HasMany
+    {
+        return $this->hasMany(ArticleDistribution::class);
+    }
+
+    public function operations(): HasMany
+    {
+        return $this->hasMany(DistributionChannelOperation::class);
+    }
+
+    public function logs(): HasMany
+    {
+        return $this->hasMany(DistributionLog::class);
+    }
+}

@@ -1,0 +1,223 @@
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
+use Illuminate\Database\Eloquent\SoftDeletes;
+
+class Article extends Model
+{
+    use SoftDeletes;
+
+    protected $table = 'articles';
+
+    protected $attributes = ['workflow_version' => 1];
+
+    protected static function booted(): void
+    {
+        static::creating(function (Article $article): void {
+            $article->publication_intent ??= $article->status === 'published'
+                ? 'none'
+                : ($article->task_id ? 'scheduled' : 'hold');
+        });
+    }
+
+    public function reviewContentHash(): string
+    {
+        return hash('sha256', json_encode($this->only([
+            'title', 'content', 'excerpt', 'keywords', 'meta_description',
+        ]), JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR));
+    }
+
+    public function scopeScheduledCandidates(Builder $query, Task $task): Builder
+    {
+        return $query->where('task_id', $task->id)->where('status', 'draft')
+            ->where('publication_intent', 'scheduled')
+            ->whereIn('review_status', $task->need_review ? ['approved'] : ['approved', 'auto_approved', 'pending']);
+    }
+
+    /** SQL form for grouped task counts; aliases are internal constants. */
+    public static function scheduledCandidateSql(): string
+    {
+        return "articles.status = 'draft' AND articles.publication_intent = 'scheduled' AND (articles.review_status = 'approved' OR (articles.review_status IN ('pending','auto_approved') AND EXISTS (SELECT 1 FROM tasks workflow_task WHERE workflow_task.id = articles.task_id AND workflow_task.need_review = 0)))";
+    }
+
+    protected $fillable = [
+        'title',
+        'slug',
+        'excerpt',
+        'content',
+        'category_id',
+        'author_id',
+        'task_id',
+        'source_title_id',
+        'original_keyword',
+        'keywords',
+        'meta_description',
+        'status',
+        'review_status',
+        'publication_intent',
+        'workflow_version',
+        'view_count',
+        'is_ai_generated',
+        'is_hot',
+        'is_featured',
+        'published_at',
+        'ai_quality_required_at_creation',
+        'ai_quality_retrieval_mode_override',
+        'ai_quality_policy_version',
+        'ai_quality_policy_snapshot',
+        'generation_evidence_snapshot',
+    ];
+
+    protected function casts(): array
+    {
+        return [
+            'category_id' => 'integer',
+            'author_id' => 'integer',
+            'task_id' => 'integer',
+            'source_title_id' => 'integer',
+            'view_count' => 'integer',
+            'workflow_version' => 'integer',
+            'is_ai_generated' => 'integer',
+            'is_hot' => 'boolean',
+            'is_featured' => 'boolean',
+            'published_at' => 'datetime',
+            'ai_quality_required_at_creation' => 'boolean',
+            'ai_quality_policy_version' => 'integer',
+            'ai_quality_policy_snapshot' => 'array',
+            'generation_evidence_snapshot' => 'array',
+        ];
+    }
+
+    public function category(): BelongsTo
+    {
+        return $this->belongsTo(Category::class, 'category_id');
+    }
+
+    public function author(): BelongsTo
+    {
+        return $this->belongsTo(Author::class, 'author_id');
+    }
+
+    public function task(): BelongsTo
+    {
+        return $this->belongsTo(Task::class, 'task_id');
+    }
+
+    public function sourceTitle(): BelongsTo
+    {
+        return $this->belongsTo(Title::class, 'source_title_id');
+    }
+
+    public function articleImages(): HasMany
+    {
+        return $this->hasMany(ArticleImage::class, 'article_id');
+    }
+
+    public function slugHistories(): HasMany
+    {
+        return $this->hasMany(ArticleSlugHistory::class);
+    }
+
+    public function reviews(): HasMany
+    {
+        return $this->hasMany(ArticleReview::class, 'article_id');
+    }
+
+    public function riskScans(): HasMany
+    {
+        return $this->hasMany(ArticleRiskScan::class, 'article_id');
+    }
+
+    public function latestPublicationHandoff(): HasOne
+    {
+        return $this->hasOne(DistributionLog::class)->where('event', 'publication.delivery_handoff')->latestOfMany();
+    }
+
+    public function latestRiskScan(): HasOne
+    {
+        return $this->hasOne(ArticleRiskScan::class, 'article_id')->latestOfMany('scanned_at');
+    }
+
+    public function aiQualityChecks(): HasMany
+    {
+        return $this->hasMany(ArticleAiQualityCheck::class);
+    }
+
+    public function aiQualityKnowledgeBases(): BelongsToMany
+    {
+        return $this->belongsToMany(
+            KnowledgeBase::class,
+            'article_ai_quality_knowledge_bases'
+        )
+            ->withPivot(['sort_order'])
+            ->withTimestamps()
+            ->orderByPivot('sort_order')
+            ->orderBy('knowledge_bases.id');
+    }
+
+    public function latestAiQualityCheck(): HasOne
+    {
+        return $this->hasOne(ArticleAiQualityCheck::class)
+            ->ofMany(['id' => 'max'], static fn (Builder $query) => $query->where('gate_applied', true));
+    }
+
+    public function aiOptimizationRuns(): HasMany
+    {
+        return $this->hasMany(ArticleAiOptimizationRun::class);
+    }
+
+    public function latestAiOptimizationRun(): HasOne
+    {
+        return $this->hasOne(ArticleAiOptimizationRun::class)->latestOfMany();
+    }
+
+    public function taskRuns(): HasMany
+    {
+        return $this->hasMany(TaskRun::class, 'article_id');
+    }
+
+    public function distributions(): HasMany
+    {
+        return $this->hasMany(ArticleDistribution::class, 'article_id');
+    }
+
+    public function hostedSiteAssignment(): HasOne
+    {
+        return $this->hasOne(HostedSiteArticleAssignment::class);
+    }
+
+    public function hostedSiteAllocationRequest(): HasOne
+    {
+        return $this->hasOne(HostedSiteAllocationRequest::class);
+    }
+
+    public function syncedRemoteDistributions(): HasMany
+    {
+        return $this->hasMany(ArticleDistribution::class, 'article_id')
+            ->where('status', 'synced')
+            ->where('action', '!=', 'delete')
+            ->whereNotNull('remote_url')
+            ->whereRaw("TRIM(remote_url) <> ''")
+            ->where(function ($query): void {
+                $query->whereRaw('LOWER(TRIM(remote_url)) LIKE ?', ['http://%'])
+                    ->orWhereRaw('LOWER(TRIM(remote_url)) LIKE ?', ['https://%']);
+            })
+            ->orderByDesc('updated_at');
+    }
+
+    /**
+     * @param  Builder<Article>  $query
+     * @return Builder<Article>
+     */
+    public function scopePublished(Builder $query): Builder
+    {
+        return $query->where('status', 'published')->whereNull('deleted_at');
+    }
+}

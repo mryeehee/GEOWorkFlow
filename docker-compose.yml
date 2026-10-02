@@ -1,0 +1,229 @@
+name: geoflow-laravel
+
+services:
+  postgres:
+    image: ${PGVECTOR_IMAGE:-pgvector/pgvector:pg16}
+    container_name: geoflow-postgres
+    environment:
+      POSTGRES_DB: ${DB_DATABASE:-geo_flow}
+      POSTGRES_USER: ${DB_USERNAME:-geo_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-geo_password}
+    ports:
+      - "127.0.0.1:${DB_EXPOSE_PORT:-15432}:5432"
+    volumes:
+      - geoflow-pgdata:${POSTGRES_CONTAINER_DATA_DIR:-/var/lib/postgresql}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-geo_user} -d ${DB_DATABASE:-geo_flow}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:7-alpine}
+    container_name: geoflow-redis
+    ports:
+      - "127.0.0.1:${REDIS_EXPOSE_PORT:-16379}:6379"
+    restart: unless-stopped
+
+  assets:
+    image: ${NODE_IMAGE:-node:22-bookworm-slim}
+    container_name: geoflow-assets
+    working_dir: /var/www/html
+    command: ["sh", "-lc", "npm ci --include=dev --no-audit --no-fund && npm run build"]
+    volumes:
+      - ./:/var/www/html
+      - geoflow-node-modules:/var/www/html/node_modules
+    restart: "no"
+
+  init:
+    image: geoflow-app:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        PHP_CLI_IMAGE: ${PHP_CLI_IMAGE:-php:8.4-cli-bookworm}
+        PECL_REDIS_VERSION: ${PECL_REDIS_VERSION:-6.3.0}
+    container_name: geoflow-init
+    working_dir: /var/www/html
+    env_file:
+      - ./.env
+    environment:
+      AUTO_FIX_STORAGE_PERMISSIONS: "${AUTO_FIX_STORAGE_PERMISSIONS:-true}"
+      AUTO_INIT_ONCE: "true"
+      GEOFLOW_SECURITY_FRESH_INSTALL_CONFIRMED: "true"
+      TRUSTED_PROXIES: "${TRUSTED_PROXIES:-REMOTE_ADDR}"
+    # 交给 entrypoint 执行自动初始化（生成 APP_KEY / migrate / geoflow:install）
+    command: ["php", "artisan", "about"]
+    volumes:
+      - ./:/var/www/html
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: "no"
+
+  app:
+    image: geoflow-app:latest
+    container_name: geoflow-app
+    working_dir: /var/www/html
+    environment:
+      AUTO_FIX_STORAGE_PERMISSIONS: "false"
+      TRUSTED_PROXIES: "${TRUSTED_PROXIES:-REMOTE_ADDR}"
+    command: ["php", "artisan", "serve", "--host=0.0.0.0", "--port=8080", "--no-reload"]
+    volumes:
+      - ./:/var/www/html
+    depends_on:
+      assets:
+        condition: service_completed_successfully
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  web:
+    image: nginx:1.27-alpine
+    container_name: geoflow-web
+    environment:
+      GEOFLOW_FORWARDED_PREFIX: "${GEOFLOW_FORWARDED_PREFIX:-}"
+    ports:
+      - "127.0.0.1:${APP_PORT:-18080}:80"
+    volumes:
+      - ./:/var/www/html:ro
+      - ./docker/nginx/local.conf:/etc/nginx/templates/default.conf.template:ro
+    depends_on:
+      app:
+        condition: service_started
+      reverb:
+        condition: service_started
+    restart: unless-stopped
+
+  queue:
+    image: geoflow-app:latest
+    container_name: geoflow-queue
+    working_dir: /var/www/html
+    environment:
+      AUTO_FIX_STORAGE_PERMISSIONS: "false"
+      COMPOSER_ON_START: "false"
+      AUTO_MIGRATE: "false"
+    command: ["php", "-d", "memory_limit=256M", "artisan", "queue:work", "redis", "--queue=system-updates,geoflow,distribution,theme-replication,default", "--sleep=1", "--tries=1", "--timeout=930", "--memory=128", "--max-jobs=100", "--max-time=3600"]
+    mem_limit: ${QUEUE_CONTAINER_MEMORY_LIMIT:-384m}
+    stop_grace_period: 960s
+    volumes:
+      - ./:/var/www/html
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  ai-quality-queue:
+    image: geoflow-app:latest
+    working_dir: /var/www/html
+    environment:
+      AUTO_FIX_STORAGE_PERMISSIONS: "false"
+      COMPOSER_ON_START: "false"
+      AUTO_MIGRATE: "false"
+    command: ["php", "-d", "memory_limit=256M", "artisan", "geoflow:work-ai-quality", "front"]
+    mem_limit: ${AI_QUALITY_QUEUE_CONTAINER_MEMORY_LIMIT:-384m}
+    stop_grace_period: ${GEOFLOW_AI_QUALITY_STOP_GRACE_PERIOD:-260s}
+    volumes:
+      - ./:/var/www/html
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    deploy:
+      replicas: ${AI_QUALITY_QUEUE_REPLICAS:-2}
+
+  ai-quality-backfill-queue:
+    image: geoflow-app:latest
+    container_name: geoflow-ai-quality-backfill-queue
+    working_dir: /var/www/html
+    environment:
+      AUTO_FIX_STORAGE_PERMISSIONS: "false"
+      COMPOSER_ON_START: "false"
+      AUTO_MIGRATE: "false"
+    command: ["php", "-d", "memory_limit=192M", "artisan", "geoflow:work-ai-quality", "backfill"]
+    mem_limit: ${AI_QUALITY_BACKFILL_QUEUE_CONTAINER_MEMORY_LIMIT:-256m}
+    stop_grace_period: ${GEOFLOW_AI_QUALITY_STOP_GRACE_PERIOD:-260s}
+    volumes:
+      - ./:/var/www/html
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  ai-optimization-queue:
+    image: geoflow-app:latest
+    container_name: geoflow-ai-optimization-queue
+    working_dir: /var/www/html
+    environment:
+      AUTO_FIX_STORAGE_PERMISSIONS: "false"
+      COMPOSER_ON_START: "false"
+      AUTO_MIGRATE: "false"
+    command: ["php", "-d", "memory_limit=256M", "artisan", "geoflow:work-ai-optimization"]
+    mem_limit: ${AI_OPTIMIZATION_QUEUE_CONTAINER_MEMORY_LIMIT:-384m}
+    stop_grace_period: ${GEOFLOW_AI_QUALITY_OPTIMIZATION_STOP_GRACE_PERIOD:-910s}
+    volumes:
+      - ./:/var/www/html
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  knowledge-queue:
+    image: geoflow-app:latest
+    container_name: geoflow-knowledge-queue
+    working_dir: /var/www/html
+    environment:
+      AUTO_FIX_STORAGE_PERMISSIONS: "false"
+      COMPOSER_ON_START: "false"
+      AUTO_MIGRATE: "false"
+    command: ["php", "-d", "memory_limit=160M", "artisan", "queue:work", "redis", "--queue=knowledge", "--sleep=1", "--tries=1", "--timeout=210", "--memory=128", "--max-jobs=20", "--max-time=1800"]
+    mem_limit: ${KNOWLEDGE_QUEUE_CONTAINER_MEMORY_LIMIT:-256m}
+    stop_grace_period: 240s
+    volumes:
+      - ./:/var/www/html
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  scheduler:
+    image: geoflow-app:latest
+    container_name: geoflow-scheduler
+    working_dir: /var/www/html
+    environment:
+      AUTO_FIX_STORAGE_PERMISSIONS: "false"
+      COMPOSER_ON_START: "false"
+      AUTO_MIGRATE: "false"
+    command: ["php", "artisan", "schedule:work"]
+    volumes:
+      - ./:/var/www/html
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  reverb:
+    image: geoflow-app:latest
+    container_name: geoflow-reverb
+    working_dir: /var/www/html
+    environment:
+      AUTO_FIX_STORAGE_PERMISSIONS: "false"
+      COMPOSER_ON_START: "false"
+      AUTO_MIGRATE: "false"
+    command: ["php", "artisan", "reverb:start", "--host=0.0.0.0", "--port=8080"]
+    expose:
+      - "8080"
+    volumes:
+      - ./:/var/www/html
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  geoflow-node-modules:
+  geoflow-pgdata:
+    external: true

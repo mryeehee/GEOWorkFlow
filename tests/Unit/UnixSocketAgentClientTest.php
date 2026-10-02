@@ -1,0 +1,553 @@
+<?php
+
+namespace Tests\Unit;
+
+use App\Services\SystemUpdater\AgentProtocolException;
+use App\Services\SystemUpdater\UnixSocketAgentClient;
+use Monolog\Formatter\LineFormatter;
+use Monolog\Level;
+use Monolog\LogRecord;
+use PHPUnit\Framework\Attributes\DataProvider;
+use RuntimeException;
+use Tests\TestCase;
+
+class UnixSocketAgentClientTest extends TestCase
+{
+    public function test_rejected_rollback_keeps_diagnostic_context_without_logging_the_authorization_code(): void
+    {
+        $previous = ini_get('zend.exception_ignore_args');
+        ini_set('zend.exception_ignore_args', '0');
+        $authorizationCode = '604827';
+
+        try {
+            $this->assertStringContainsString($authorizationCode, $this->formatException(new RuntimeException($authorizationCode)));
+            try {
+                $this->withAgentResponse(
+                    ['error' => 'rollback_target_not_allowed'],
+                    fn (UnixSocketAgentClient $client): array => $client->startRollback('20260827T120000Z-1234abcd', $authorizationCode),
+                    409,
+                );
+                $this->fail('The rejected rollback must throw an exception.');
+            } catch (RuntimeException $exception) {
+                $log = $this->formatException($exception);
+                $this->assertStringContainsString('rollback_target_not_allowed', $log);
+                $this->assertStringContainsString('UnixSocketAgentClient->startRollback(', $log);
+                $this->assertStringNotContainsString($authorizationCode, $log);
+            }
+        } finally {
+            ini_set('zend.exception_ignore_args', (string) $previous);
+        }
+    }
+
+    private function formatException(\Throwable $exception): string
+    {
+        return (new LineFormatter(null, 'Y-m-d H:i:s', true, true, true))->format(new LogRecord(
+            new \DateTimeImmutable,
+            'updater-test',
+            Level::Error,
+            $exception->getMessage(),
+            ['exception' => $exception],
+        ));
+    }
+
+    #[DataProvider('mutationFailureCases')]
+    public function test_mutation_failures_redact_credentials_even_when_exception_arguments_are_enabled(string $method, string $failure): void
+    {
+        $previous = ini_get('zend.exception_ignore_args');
+        $previousLength = ini_get('zend.exception_string_param_max_len');
+        ini_set('zend.exception_ignore_args', '0');
+        ini_set('zend.exception_string_param_max_len', '128');
+        $authorizationCode = $failure === 'validation' ? '604827bad' : '604827';
+        $controlToken = str_repeat('c', 43);
+        $expectedReason = match ($failure) {
+            'validation' => 'authorization code is invalid',
+            'transport' => 'invalid HTTP response',
+            default => 'mutation_rejected',
+        };
+
+        try {
+            $positive = $this->formatException(new RuntimeException($authorizationCode.' '.$controlToken));
+            $this->assertStringContainsString($authorizationCode, $positive);
+            $this->assertStringContainsString($controlToken, $positive);
+            $invoke = fn (UnixSocketAgentClient $client): array => $method === 'startRollback'
+                ? $client->startRollback('20260827T120000Z-1234abcd', $authorizationCode)
+                : $client->{$method}($authorizationCode);
+            try {
+                if ($failure === 'validation') {
+                    $invoke(new UnixSocketAgentClient);
+                } else {
+                    $this->withAgentResponse(['error' => 'mutation_rejected'], $invoke, $failure === 'transport' ? 0 : 409);
+                }
+                $this->fail('The failed mutation must throw an exception.');
+            } catch (RuntimeException $exception) {
+                $log = $this->formatException($exception);
+                $this->assertStringContainsString($expectedReason, $log);
+                $this->assertStringContainsString('UnixSocketAgentClient->'.$method.'(', $log);
+                $this->assertStringNotContainsString($authorizationCode, $log);
+                $this->assertStringNotContainsString($controlToken, $log);
+            }
+        } finally {
+            ini_set('zend.exception_ignore_args', (string) $previous);
+            ini_set('zend.exception_string_param_max_len', (string) $previousLength);
+        }
+    }
+
+    public static function mutationFailureCases(): array
+    {
+        $cases = [];
+        foreach (['startUpdate', 'startBackup', 'startRollback'] as $method) {
+            foreach (['rejected', 'transport', 'validation'] as $failure) {
+                $cases[$method.' '.$failure] = [$method, $failure];
+            }
+        }
+
+        return $cases;
+    }
+
+    public function test_it_reads_authenticated_status_from_the_local_unix_socket(): void
+    {
+        $directory = sys_get_temp_dir().'/geoflow-updater-client-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700, true);
+        $socketPath = $directory.'/agent.sock';
+        $tokenPath = $directory.'/control.token';
+        $token = str_repeat('a', 43);
+        file_put_contents($tokenPath, $token."\n");
+        chmod($tokenPath, 0640);
+        $server = stream_socket_server('unix://'.$socketPath, $errorCode, $errorMessage);
+        $this->assertIsResource($server, $errorMessage);
+        $pid = pcntl_fork();
+
+        if ($pid === 0) {
+            $connection = stream_socket_accept($server, 5);
+            if (is_resource($connection)) {
+                $request = '';
+                while (! str_contains($request, "\r\n\r\n")) {
+                    $chunk = fread($connection, 4096);
+                    if (! is_string($chunk) || $chunk === '') {
+                        break;
+                    }
+                    $request .= $chunk;
+                }
+                $authorized = str_contains($request, 'Authorization: Bearer '.$token."\r\n");
+                $body = json_encode([
+                    'schema_version' => 1,
+                    'status' => $authorized ? 'pass' : 'fail',
+                    'updater_version' => '0.1.0',
+                    'checks' => [],
+                ], JSON_THROW_ON_ERROR);
+                fwrite($connection, "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: ".strlen($body)."\r\n\r\n".$body);
+                fclose($connection);
+            }
+            fclose($server);
+            exit(0);
+        }
+
+        try {
+            config([
+                'geoflow.updater_socket' => $socketPath,
+                'geoflow.updater_control_token_file' => $tokenPath,
+                'geoflow.updater_instance_id' => 'primary',
+            ]);
+
+            $status = (new UnixSocketAgentClient)->status();
+
+            $this->assertSame('pass', $status['status']);
+            $this->assertSame('0.1.0', $status['updater_version']);
+        } finally {
+            fclose($server);
+            pcntl_waitpid($pid, $waitStatus);
+            @unlink($socketPath);
+            @unlink($tokenPath);
+            @rmdir($directory);
+        }
+    }
+
+    public function test_it_rejects_a_control_token_with_header_injection_characters(): void
+    {
+        $tokenPath = tempnam(sys_get_temp_dir(), 'geoflow-updater-token-');
+        file_put_contents($tokenPath, str_repeat('a', 43)."\r\nX-Injection: yes");
+        chmod($tokenPath, 0640);
+        config([
+            'geoflow.updater_socket' => '/run/geoflow-updater/missing.sock',
+            'geoflow.updater_control_token_file' => $tokenPath,
+            'geoflow.updater_instance_id' => 'primary',
+        ]);
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('credential is invalid');
+
+        try {
+            (new UnixSocketAgentClient)->status();
+        } finally {
+            @unlink($tokenPath);
+        }
+    }
+
+    public function test_it_uses_only_the_typed_operation_endpoints(): void
+    {
+        $directory = sys_get_temp_dir().'/geoflow-updater-client-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700, true);
+        $socketPath = $directory.'/agent.sock';
+        $tokenPath = $directory.'/control.token';
+        $token = str_repeat('b', 43);
+        file_put_contents($tokenPath, $token."\n");
+        chmod($tokenPath, 0640);
+        $server = stream_socket_server('unix://'.$socketPath, $errorCode, $errorMessage);
+        $this->assertIsResource($server, $errorMessage);
+        $pid = pcntl_fork();
+
+        if ($pid === 0) {
+            for ($index = 0; $index < 6; $index++) {
+                $connection = stream_socket_accept($server, 5);
+                if (! is_resource($connection)) {
+                    exit(1);
+                }
+                $request = '';
+                while (! str_contains($request, "\r\n\r\n")) {
+                    $chunk = fread($connection, 4096);
+                    if (! is_string($chunk) || $chunk === '') {
+                        break;
+                    }
+                    $request .= $chunk;
+                }
+                [$headers, $requestBody] = array_pad(explode("\r\n\r\n", $request, 2), 2, '');
+                preg_match('/\r\nContent-Length: (\d+)\r\n/i', "\r\n".$headers."\r\n", $lengthMatch);
+                $expectedLength = (int) ($lengthMatch[1] ?? 0);
+                while (strlen($requestBody) < $expectedLength) {
+                    $chunk = fread($connection, $expectedLength - strlen($requestBody));
+                    if (! is_string($chunk) || $chunk === '') {
+                        break;
+                    }
+                    $requestBody .= $chunk;
+                }
+                $firstLine = strtok($headers, "\r\n");
+                $updateAuthorized = str_contains($headers, "X-GEOFlow-Updater-Authorization: 123456\r\n");
+                $rollbackAuthorized = str_contains($headers, "X-GEOFlow-Updater-Authorization: 234567\r\n");
+                $operation = [
+                    'schema_version' => 1,
+                    'id' => '20260827T123456.000000000Z-0011223344556677',
+                    'instance_id' => 'primary',
+                    'kind' => 'update',
+                    'status' => 'queued',
+                    'stages' => [],
+                    'started_at' => '2026-08-27T12:34:56Z',
+                ];
+                $status = '200 OK';
+                if ($firstLine === 'POST /v1/instances/primary/updates HTTP/1.0' && $updateAuthorized
+                    && ($requestBody === '' || $requestBody === json_encode(['allow_maintenance' => true, 'expected_plan_sha256' => str_repeat('a', 64)]))) {
+                    $status = '202 Accepted';
+                } elseif ($firstLine === 'POST /v1/instances/primary/switch-backs HTTP/1.0' && $updateAuthorized && $requestBody === '') {
+                    $status = '202 Accepted';
+                    $operation['kind'] = 'switch-back';
+                } elseif ($firstLine === 'POST /v1/instances/primary/rollbacks HTTP/1.0'
+                    && $requestBody === '{"recovery_point_id":"20260827T120000Z-1234abcd"}'
+                    && $rollbackAuthorized) {
+                    $status = '202 Accepted';
+                    $operation['kind'] = 'rollback';
+                } elseif ($firstLine === 'GET /v1/instances/primary/operations/current HTTP/1.0') {
+                    $operation['status'] = 'running';
+                } elseif ($firstLine === 'GET /v1/instances/primary/backups HTTP/1.0') {
+                    $operation = [
+                        'schema_version' => 1,
+                        'recovery_points' => [[
+                            'schema_version' => 1,
+                            'id' => '20260827T120000Z-1234abcd',
+                            'instance_id' => 'primary',
+                            'reason' => 'manual-backup',
+                            'created_at' => '2026-08-27T12:00:00Z',
+                            'version' => '2.4.0',
+                            'release_sequence' => 17,
+                        ]],
+                    ];
+                } else {
+                    $status = '400 Bad Request';
+                    $operation = ['error' => 'invalid_test_request'];
+                }
+                $body = json_encode($operation, JSON_THROW_ON_ERROR);
+                fwrite($connection, "HTTP/1.0 {$status}\r\nContent-Type: application/json\r\nContent-Length: ".strlen($body)."\r\n\r\n".$body);
+                fclose($connection);
+            }
+            fclose($server);
+            exit(0);
+        }
+
+        try {
+            config([
+                'geoflow.updater_socket' => $socketPath,
+                'geoflow.updater_control_token_file' => $tokenPath,
+                'geoflow.updater_instance_id' => 'primary',
+            ]);
+            $client = new UnixSocketAgentClient;
+
+            $this->assertSame('update', $client->startUpdate('123456')['kind']);
+            $this->assertSame('update', $client->startPlannedUpdate('123456', true, str_repeat('a', 64))['kind']);
+            $this->assertSame('switch-back', $client->startSwitchBack('123456')['kind']);
+            $this->assertSame('rollback', $client->startRollback('20260827T120000Z-1234abcd', '234567')['kind']);
+            $this->assertSame('running', $client->currentOperation()['status']);
+            $this->assertSame('20260827T120000Z-1234abcd', $client->recoveryPoints()[0]['id']);
+        } finally {
+            fclose($server);
+            pcntl_waitpid($pid, $waitStatus);
+            @unlink($socketPath);
+            @unlink($tokenPath);
+            @rmdir($directory);
+        }
+    }
+
+    public function test_it_rejects_an_invalid_recovery_point_before_connecting(): void
+    {
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('recovery point identifier is invalid');
+
+        (new UnixSocketAgentClient)->startRollback('../unsafe', '123456');
+    }
+
+    public function test_it_rejects_an_invalid_mutation_authorization_code_before_connecting(): void
+    {
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('authorization code is invalid');
+
+        (new UnixSocketAgentClient)->startUpdate("123456\r\nX-Injection: yes");
+    }
+
+    public function test_it_rejects_non_scalar_status_fields_at_the_socket_boundary(): void
+    {
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('unsupported status response');
+
+        $this->withAgentResponse([
+            'schema_version' => 1,
+            'status' => 'pass',
+            'updater_version' => ['unexpected'],
+            'checks' => [],
+        ], fn (UnixSocketAgentClient $client): array => $client->status());
+    }
+
+    public function test_it_rejects_non_scalar_recovery_point_fields_at_the_socket_boundary(): void
+    {
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('invalid recovery point');
+
+        $this->withAgentResponse([
+            'schema_version' => 1,
+            'recovery_points' => [[
+                'schema_version' => 1,
+                'id' => '20260827T120000Z-1234abcd',
+                'instance_id' => 'primary',
+                'reason' => ['unexpected'],
+                'created_at' => '2026-08-27T12:00:00Z',
+                'version' => '2.4.0',
+                'release_sequence' => 17,
+            ]],
+        ], fn (UnixSocketAgentClient $client): array => $client->recoveryPoints());
+    }
+
+    public function test_it_rejects_non_scalar_operation_fields_at_the_socket_boundary(): void
+    {
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('invalid operation response');
+
+        $this->withAgentResponse([
+            'schema_version' => 1,
+            'id' => '20260827T123456.000000000Z-0011223344556677',
+            'instance_id' => 'primary',
+            'kind' => 'update',
+            'status' => 'failed',
+            'stages' => [],
+            'error' => ['unexpected'],
+            'started_at' => '2026-08-27T12:34:56Z',
+            'completed_at' => '2026-08-27T12:35:56Z',
+        ], fn (UnixSocketAgentClient $client): ?array => $client->currentOperation());
+    }
+
+    public function test_it_accepts_the_durable_recovery_required_operation_status(): void
+    {
+        $operation = $this->withAgentResponse([
+            'schema_version' => 1,
+            'id' => '20260827T123456.000000000Z-0011223344556677',
+            'instance_id' => 'primary',
+            'kind' => 'rollback',
+            'status' => 'recovery_required',
+            'current_stage' => 'rollback',
+            'stages' => [[
+                'name' => 'rollback',
+                'status' => 'failed',
+                'message' => 'restore will be retried',
+                'updated_at' => '2026-08-27T12:35:00Z',
+            ]],
+            'recovery_point_id' => '20260827T120000Z-1234abcd',
+            'started_at' => '2026-08-27T12:34:56Z',
+            'completed_at' => '2026-08-27T12:35:56Z',
+        ], fn (UnixSocketAgentClient $client): ?array => $client->currentOperation());
+
+        $this->assertSame('recovery_required', $operation['status']);
+    }
+
+    public function test_recovery_operation_from_another_instance_is_rejected_at_the_socket_boundary(): void
+    {
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('invalid operation response');
+        $this->withAgentResponse([
+            'schema_version' => 1, 'id' => '20260827T123456.000000000Z-0011223344556677',
+            'instance_id' => 'other-instance', 'kind' => 'update', 'status' => 'recovery_required',
+            'stages' => [], 'started_at' => '2026-08-27T12:34:56Z',
+        ], fn (UnixSocketAgentClient $client): ?array => $client->currentOperation());
+    }
+
+    public function test_recovery_status_from_another_instance_is_rejected_at_the_socket_boundary(): void
+    {
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('unsupported status response');
+        $this->withAgentResponse([
+            'schema_version' => 1, 'status' => 'fail', 'updater_version' => '0.3.0',
+            'instance' => ['id' => 'other-instance', 'version' => '3.0.0', 'release_sequence' => 17],
+            'checks' => [['id' => 'mutation-authorization', 'status' => 'pass', 'message' => 'Configured']],
+        ], fn (UnixSocketAgentClient $client): array => $client->status());
+    }
+
+    /**
+     * @template T
+     *
+     * @param  array<string, mixed>  $payload
+     * @param  callable(UnixSocketAgentClient): T  $callback
+     * @return T
+     */
+    public function test_preview_accepts_a_complete_plan_and_rejects_malformed_fields(): void
+    {
+        $plan = ['schema_version' => 1, 'source_sequence' => 17, 'target_sequence' => 18, 'target_version' => '3.0.0',
+            'strategy' => 'maintenance', 'plan_sha256' => str_repeat('a', 64), 'upgrade_plan_sha256' => str_repeat('b', 64),
+            'layout_change' => true, 'pending_migrations' => [],
+            'steps' => [['id' => 'migrate', 'kind' => 'migrate', 'phase' => 'apply', 'timeout_seconds' => 600, 'online' => false]]];
+        $this->assertSame($plan, $this->withAgentResponse($plan, fn (UnixSocketAgentClient $client): array => $client->preview()));
+        foreach (['plan_sha256' => 'wrong', 'strategy' => 'automatic', 'layout_change' => 'true', 'pending_migrations' => [false], 'steps' => [['kind' => 'shell']]] as $key => $value) {
+            try {
+                $this->withAgentResponse(array_replace($plan, [$key => $value]), fn (UnixSocketAgentClient $client): array => $client->preview());
+                $this->fail('Invalid preview field accepted: '.$key);
+            } catch (RuntimeException $exception) {
+                $this->assertStringContainsString('Updater returned', $exception->getMessage());
+            }
+        }
+    }
+
+    public function test_planned_update_rejects_a_bad_preview_hash_before_connecting(): void
+    {
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('preview hash is invalid');
+        (new UnixSocketAgentClient)->startPlannedUpdate('123456', true, '../bad');
+    }
+
+    public function test_preview_accepts_equal_sequence_only_for_maintenance_layout_conversion(): void
+    {
+        $plan = ['schema_version' => 1, 'source_sequence' => 17, 'target_sequence' => 17, 'target_version' => '3.1.0',
+            'strategy' => 'maintenance', 'plan_sha256' => str_repeat('a', 64), 'upgrade_plan_sha256' => str_repeat('b', 64),
+            'layout_change' => true, 'pending_migrations' => [],
+            'steps' => [['id' => 'migrate', 'kind' => 'migrate', 'phase' => 'apply', 'timeout_seconds' => 600, 'online' => false]]];
+        $this->assertSame($plan, $this->withAgentResponse($plan, fn (UnixSocketAgentClient $client): array => $client->preview()));
+        foreach ([['target_sequence' => 16], ['strategy' => 'online'], ['layout_change' => false], ['layout_change' => 'true']] as $conflict) {
+            $this->assertThrows(
+                fn () => $this->withAgentResponse(array_replace($plan, $conflict), fn (UnixSocketAgentClient $client): array => $client->preview()),
+                RuntimeException::class,
+            );
+        }
+    }
+
+    private function coordinatedCapabilities(): array
+    {
+        return ['schema_version' => 2, 'instance_id' => 'primary', 'protocol_version' => 2, 'updater_protocol' => 5,
+            'actions' => ['update', 'backup', 'restore', 'switch-back'], 'features' => ['plans' => true, 'requests' => true, 'idempotency' => true, 'recovery_epoch' => true],
+            'maintenance_confirmation' => true, 'restore_policy' => 'latest_update_checkpoint', 'background_status' => 'ready',
+            'recovery' => ['host_id' => str_repeat('b', 32), 'epoch' => str_repeat('a', 32), 'phase' => 'ready']];
+    }
+
+    public function test_coordinated_capabilities_require_the_real_versioned_contract(): void
+    {
+        $payload = $this->coordinatedCapabilities();
+        $this->assertSame($payload, $this->withAgentResponse($payload, fn ($client) => $client->capabilities(), expectedLine: 'GET /v2/instances/primary/capabilities HTTP/1.0'));
+        $payload['features']['idempotency'] = false;
+        $this->expectException(RuntimeException::class);
+        $this->withAgentResponse($payload, fn ($client) => $client->capabilities());
+    }
+
+    public function test_only_an_exact_versioned_request_not_found_is_a_missing_receipt(): void
+    {
+        $this->assertNull($this->withAgentResponse(['error' => 'request_not_found'], fn ($client) => $client->requestReceipt('original-request-001'), 404,
+            expectedLine: 'GET /v2/instances/primary/requests/original-request-001 HTTP/1.0'));
+        $this->expectException(AgentProtocolException::class);
+        $this->withAgentResponse(['error' => 'not_found'], fn ($client) => $client->requestReceipt('original-request-001'), 404);
+    }
+
+    public function test_coordinated_rate_limit_preserves_retry_after_without_retrying_the_request(): void
+    {
+        try {
+            $this->withAgentResponse(['error' => 'rate_limited'], fn ($client) => $client->requestReceipt('original-request-001'), 429, responseHeaders: "Retry-After: 17\r\n");
+            $this->fail('Rate limit should be returned to caller.');
+        } catch (AgentProtocolException $exception) {
+            $this->assertSame(429, $exception->httpStatus);
+            $this->assertSame(17, $exception->retryAfterSeconds);
+        }
+    }
+
+    public function test_receipt_lookup_rejects_another_request_identity_even_when_the_operation_is_pending(): void
+    {
+        $envelope = ['schema_version' => 2, 'instance_id' => 'primary', 'client_request_id' => 'another-request-002',
+            'business_sha256' => str_repeat('d', 64), 'operation_id' => '20260916T120000.000000001Z-'.str_repeat('f', 16),
+            'action' => 'backup', 'plan_id' => str_repeat('c', 32), 'accepted_epoch' => str_repeat('a', 32),
+            'admission_status' => 'pending', 'background_status' => 'ready', 'operation' => null];
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('different request receipt');
+        $this->withAgentResponse($envelope, fn ($client) => $client->requestReceipt('original-request-001'));
+    }
+
+    private function withAgentResponse(array $payload, callable $callback, int $httpStatus = 200, ?string $expectedLine = null, string $responseHeaders = ''): mixed
+    {
+        $directory = sys_get_temp_dir().'/geoflow-updater-client-'.bin2hex(random_bytes(8));
+        mkdir($directory, 0700, true);
+        $socketPath = $directory.'/agent.sock';
+        $tokenPath = $directory.'/control.token';
+        $token = str_repeat('c', 43);
+        file_put_contents($tokenPath, $token."\n");
+        chmod($tokenPath, 0640);
+        $server = stream_socket_server('unix://'.$socketPath, $errorCode, $errorMessage);
+        $this->assertIsResource($server, $errorMessage);
+        $pid = pcntl_fork();
+
+        if ($pid === 0) {
+            $connection = stream_socket_accept($server, 5);
+            if (is_resource($connection)) {
+                $received = '';
+                while (! feof($connection)) {
+                    $chunk = fread($connection, 4096);
+                    $received .= is_string($chunk) ? $chunk : '';
+                    if (! is_string($chunk) || $chunk === '' || str_contains($chunk, "\r\n\r\n")) {
+                        break;
+                    }
+                }
+                if ($expectedLine !== null && ! str_starts_with($received, $expectedLine."\r\n")) {
+                    $httpStatus = 400;
+                    $payload = ['error' => 'unexpected_protocol_endpoint'];
+                }
+                $body = json_encode($payload, JSON_THROW_ON_ERROR);
+                fwrite($connection, "HTTP/1.0 {$httpStatus} Response\r\n{$responseHeaders}Content-Type: application/json\r\nContent-Length: ".strlen($body)."\r\n\r\n".$body);
+                fclose($connection);
+            }
+            fclose($server);
+            exit(0);
+        }
+
+        try {
+            config([
+                'geoflow.updater_socket' => $socketPath,
+                'geoflow.updater_control_token_file' => $tokenPath,
+                'geoflow.updater_instance_id' => 'primary',
+            ]);
+
+            return $callback(new UnixSocketAgentClient);
+        } finally {
+            fclose($server);
+            pcntl_waitpid($pid, $waitStatus);
+            @unlink($socketPath);
+            @unlink($tokenPath);
+            @rmdir($directory);
+        }
+    }
+}

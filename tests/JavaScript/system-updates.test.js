@@ -1,0 +1,268 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import {
+    copySystemUpdaterCommand,
+    initializeSystemUpdaterAutoReload,
+    initializeSystemUpdaterAuthorizationDialogs,
+    initializeSystemUpdaterErrorDialog,
+    updaterReloadDelay,
+    prepareUpdaterRequest,
+    initializeUpdaterAdmission,
+} from '../../resources/js/admin/system-updates.js';
+
+test('updater reload delay accepts only bounded millisecond values', () => {
+    assert.equal(updaterReloadDelay('5000'), 5000);
+    assert.equal(updaterReloadDelay('999'), null);
+    assert.equal(updaterReloadDelay('60001'), null);
+    assert.equal(updaterReloadDelay('invalid'), null);
+});
+
+test('active updater schedules one page reload', () => {
+    let scheduledDelay = null;
+    let reloads = 0;
+    const root = {
+        querySelector: () => ({ dataset: { systemUpdaterAutoReload: '5000' } }),
+    };
+
+    initializeSystemUpdaterAutoReload(
+        root,
+        (callback, delay) => {
+            scheduledDelay = delay;
+            callback();
+            return 42;
+        },
+        () => {
+            reloads++;
+        },
+    );
+
+    assert.equal(scheduledDelay, 5000);
+    assert.equal(reloads, 1);
+});
+
+test('copy command reads the rendered command and updates the visible label', async () => {
+    let copied = '';
+    const label = { textContent: '复制命令' };
+    const button = {
+        dataset: {
+            systemUpdaterCopy: '#updater-command-install',
+            copiedLabel: '已复制',
+        },
+        querySelector: () => label,
+    };
+    const root = {
+        querySelector: (selector) => selector === '#updater-command-install'
+            ? { textContent: '  sudo geoflow-updater doctor --instance primary  ' }
+            : null,
+    };
+
+    const copiedSuccessfully = await copySystemUpdaterCommand(
+        button,
+        root,
+        async (value) => {
+            copied = value;
+        },
+    );
+
+    assert.equal(copiedSuccessfully, true);
+    assert.equal(copied, 'sudo geoflow-updater doctor --instance primary');
+    assert.equal(label.textContent, '已复制');
+});
+
+test('updater error dialog opens in the center and can be dismissed', () => {
+    let showCount = 0;
+    let closeCount = 0;
+    let focusCount = 0;
+    const closeButton = {
+        focus: () => {
+            focusCount++;
+        },
+    };
+    const dialog = {
+        open: true,
+        querySelectorAll: () => [closeButton],
+        showModal: () => {
+            dialog.open = true;
+            showCount++;
+        },
+        close: () => {
+            dialog.open = false;
+            closeCount++;
+        },
+    };
+    const root = {
+        querySelector: () => dialog,
+    };
+
+    const controller = initializeSystemUpdaterErrorDialog(root);
+
+    assert.ok(controller);
+    assert.equal(showCount, 1);
+    assert.equal(focusCount, 1);
+    assert.equal(closeCount, 1);
+
+    controller.close();
+    assert.equal(closeCount, 2);
+});
+
+test('updater error remains server-visible when the dialog API is unavailable', () => {
+    const dialog = { open: true };
+    const root = { querySelector: () => dialog };
+
+    const controller = initializeSystemUpdaterErrorDialog(root);
+
+    assert.equal(controller, null);
+    assert.equal(dialog.open, true);
+});
+
+test('authorized updater actions collect central prompt fields and preserve the original submitter', async () => {
+    class FakeElement {
+        closest() { return null; }
+    }
+    class FakeInput extends FakeElement {
+        constructor() {
+            super();
+            this.value = '';
+        }
+    }
+    class FakeButton extends FakeElement {}
+    class FakeForm extends FakeElement {
+        constructor() {
+            super();
+            this.authorization = new FakeInput();
+            this.password = new FakeInput();
+            this.dataset = {
+                authorizationLabel: 'Authorization code',
+                authorizationPatternMessage: 'Enter six digits',
+                dialogConfirmLabel: 'Update system',
+                dialogGuidance: 'A verified backup is available.',
+                dialogMessage: 'The service will restart.',
+                dialogTitle: 'Update GEOWorkFlow',
+                dialogTone: 'warning',
+                passwordLabel: 'Current password',
+                passwordRequired: 'true',
+                requiredMessage: 'Required',
+            };
+            this.submitter = null;
+        }
+        closest() { return this; }
+        querySelector(selector) {
+            if (selector.includes('updater_authorization_code')) return this.authorization;
+            if (selector.includes('current_admin_password')) return this.password;
+            return null;
+        }
+        requestSubmit(submitter) { this.submitter = submitter; }
+    }
+
+    const listeners = new Map();
+    const root = {
+        addEventListener(type, listener) { listeners.set(type, listener); },
+    };
+    const promptCalls = [];
+    const windowRef = {
+        AdminActionDialog: {
+            async prompt(options) {
+                promptCalls.push(options);
+                return { authorization: '123456', password: 'secret-123' };
+            },
+        },
+        Element: FakeElement,
+        HTMLButtonElement: FakeButton,
+        HTMLFormElement: FakeForm,
+        HTMLInputElement: FakeInput,
+    };
+    const form = new FakeForm();
+    const button = new FakeInput();
+    const event = {
+        target: form,
+        submitter: button,
+        defaultPrevented: false,
+        preventDefault() { this.defaultPrevented = true; },
+    };
+
+    initializeSystemUpdaterAuthorizationDialogs(root, windowRef);
+    await listeners.get('submit')(event);
+
+    assert.equal(event.defaultPrevented, true);
+    assert.equal(promptCalls.length, 1);
+    assert.equal(promptCalls[0].fields.length, 2);
+    assert.equal(promptCalls[0].fields[0].pattern, '[0-9]{6}');
+    assert.equal(form.authorization.value, '123456');
+    assert.equal(form.password.value, 'secret-123');
+    assert.equal(form.submitter, button);
+});
+
+
+test('planned confirmation never prompts or submits with a missing hash or unchecked maintenance', async () => {
+    class Element { closest() { return this; } }
+    class Input extends Element {}
+    class Form extends Element {
+        constructor() {
+            super(); this.dataset = {}; this.auth = new Input(); this.plan = new Input(); this.maintenance = new Input();
+            this.plan.value = ''; this.maintenance.checked = false; this.submitted = false;
+        }
+        querySelector(selector) {
+            if (selector.includes('updater_authorization_code')) return this.auth;
+            if (selector.includes('expected_plan_sha256')) return this.plan;
+            if (selector.includes('allow_maintenance')) return this.maintenance;
+            return null;
+        }
+        requestSubmit() { this.submitted = true; }
+    }
+    let listener; let prompts = 0;
+    const form = new Form();
+    initializeSystemUpdaterAuthorizationDialogs({ addEventListener(_type, callback) { listener = callback; } }, {
+        Element, HTMLFormElement: Form, HTMLInputElement: Input, HTMLButtonElement: Input,
+        AdminActionDialog: { async prompt() { prompts++; return { authorization: '123456' }; } },
+    });
+    const event = { target: form, preventDefault() {} };
+    await listener(event);
+    form.plan.value = 'a'.repeat(64);
+    await listener(event);
+    assert.equal(prompts, 0);
+    assert.equal(form.submitted, false);
+    form.maintenance.checked = true;
+    await listener(event);
+    assert.equal(prompts, 1);
+    assert.equal(form.submitted, true);
+    assert.equal(form.plan.value, 'a'.repeat(64));
+    assert.equal(form.maintenance.checked, true);
+});
+
+
+test('admission journal preserves the first request across reload and refuses a second POST', () => {
+    const map = new Map();
+    const storage = { getItem: key => map.get(key) ?? null, setItem: (key, value) => map.set(key, value) };
+    const instance = '12345678-1234-1234-1234-123456789abc';
+    assert.equal(prepareUpdaterRequest(storage, instance, 'browser-request-001'), true);
+    assert.equal(prepareUpdaterRequest(storage, instance, 'browser-request-001'), false);
+    assert.deepEqual([...map.values()], ['browser-request-001']);
+});
+
+test('admission journal fails closed on storage failure or invalid identity', () => {
+    const unavailable = { getItem: () => null, setItem: () => { throw new Error('full'); } };
+    const instance = '12345678-1234-1234-1234-123456789abc';
+    assert.throws(() => prepareUpdaterRequest(unavailable, instance, 'browser-request-001'));
+    assert.throws(() => prepareUpdaterRequest(unavailable, 'wrong-instance', 'browser-request-001'));
+    assert.throws(() => prepareUpdaterRequest({getItem: () => null, setItem: () => {}}, instance, 'browser-request-001'));
+});
+
+
+test('admission enables the initially disabled button only after registering the guard', () => {
+    const button = {disabled: true};
+    const notice = {classList: {add: () => {}}};
+    let handler;
+    const form = {
+        addEventListener: (name, callback) => { assert.equal(button.disabled, true); handler = callback; },
+        querySelector: selector => selector === 'button[type="submit"]' ? button : notice,
+    };
+    const root = {querySelector: () => ({querySelector: selector => selector === '[data-updater-admission]' ? form : null})};
+    initializeUpdaterAdmission(root, {});
+    assert.equal(typeof handler, 'function');
+    assert.equal(button.disabled, false);
+    button.disabled = true;
+    form.addEventListener = () => { throw new Error('initialization failed'); };
+    assert.throws(() => initializeUpdaterAdmission(root, {}));
+    assert.equal(button.disabled, true);
+});

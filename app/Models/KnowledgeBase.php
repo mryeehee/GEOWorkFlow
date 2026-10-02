@@ -1,0 +1,146 @@
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
+
+class KnowledgeBase extends Model
+{
+    protected $table = 'knowledge_bases';
+
+    protected $attributes = [
+        'chunk_sync_status' => 'idle',
+        'chunk_source_hash' => '',
+        'chunk_sync_require_real_embedding' => false,
+        'ai_quality_content_hash' => '',
+        'ai_quality_content_length' => 0,
+    ];
+
+    protected $fillable = [
+        'name',
+        'description',
+        'content',
+        'ai_quality_content_hash',
+        'ai_quality_content_length',
+        'character_count',
+        'used_task_count',
+        'file_type',
+        'file_path',
+        'word_count',
+        'usage_count',
+        'source_name',
+        'source_url',
+        'source_type',
+        'business_line',
+        'effective_date',
+        'risk_level',
+        'review_status',
+        'chunk_sync_status',
+        'chunk_sync_token',
+        'chunk_source_hash',
+        'chunk_serving_generation',
+        'chunk_serving_source_hash',
+        'chunk_manifest_hash',
+        'chunk_sync_error',
+        'chunk_sync_require_real_embedding',
+        'chunk_synced_at',
+    ];
+
+    protected function casts(): array
+    {
+        return [
+            'character_count' => 'integer',
+            'ai_quality_content_length' => 'integer',
+            'used_task_count' => 'integer',
+            'word_count' => 'integer',
+            'usage_count' => 'integer',
+            'effective_date' => 'date',
+            'chunk_sync_require_real_embedding' => 'boolean',
+            'chunk_embedding_dimensions' => 'integer',
+            'chunk_sync_embedding_profile_version' => 'integer',
+            'chunk_sync_embedding_model_id' => 'integer',
+            'chunk_embedding_model_id' => 'integer',
+            'chunk_embedding_profile_version' => 'integer',
+            'chunk_synced_at' => 'datetime',
+        ];
+    }
+
+    protected static function booted(): void
+    {
+        static::saving(function (self $knowledgeBase): void {
+            if ($knowledgeBase->isDirty('content') || trim((string) $knowledgeBase->ai_quality_content_hash) === '') {
+                $content = (string) ($knowledgeBase->content ?? '');
+                $knowledgeBase->ai_quality_content_hash = hash('sha256', $content);
+                $knowledgeBase->ai_quality_content_length = mb_strlen($content, 'UTF-8');
+            }
+        });
+    }
+
+    public function chunks(): HasMany
+    {
+        return $this->hasMany(KnowledgeChunk::class, 'knowledge_base_id');
+    }
+
+    public function factLibrary(): HasOne
+    {
+        return $this->hasOne(KnowledgeFactLibrary::class);
+    }
+
+    public function systemBinding(): HasOne
+    {
+        return $this->hasOne(SystemKnowledgeBase::class);
+    }
+
+    public function revisions(): HasMany
+    {
+        return $this->hasMany(KnowledgeBaseRevision::class)->orderByDesc('revision_number');
+    }
+
+    public function mediaAssets(): HasMany
+    {
+        return $this->hasMany(KnowledgeMediaAsset::class)->orderBy('sort_order')->orderBy('id');
+    }
+
+    public function isSystemManaged(): bool
+    {
+        if ($this->relationLoaded('systemBinding')) {
+            return $this->systemBinding instanceof SystemKnowledgeBase;
+        }
+
+        return $this->systemBinding()->exists();
+    }
+
+    public function servingChunkSourceHash(): string
+    {
+        $serving = trim((string) $this->chunk_serving_source_hash);
+
+        return $serving !== '' ? $serving : trim((string) $this->chunk_source_hash);
+    }
+
+    public function tasks(): HasMany
+    {
+        return $this->hasMany(Task::class, 'knowledge_base_id');
+    }
+
+    public function linkedTasks(): BelongsToMany
+    {
+        return $this->belongsToMany(Task::class, 'task_knowledge_bases')
+            ->withPivot(['sort_order'])
+            ->withTimestamps()
+            ->orderByPivot('sort_order')
+            ->orderBy('tasks.id');
+    }
+
+    public function aiQualityArticles(): BelongsToMany
+    {
+        return $this->belongsToMany(
+            Article::class,
+            'article_ai_quality_knowledge_bases'
+        )
+            ->withPivot(['sort_order'])
+            ->withTimestamps();
+    }
+}

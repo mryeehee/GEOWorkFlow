@@ -1,0 +1,331 @@
+<?php
+
+namespace App\Jobs;
+
+use App\Data\Ai\AiExecutionContext;
+use App\Exceptions\AiModelAccessException;
+use App\Exceptions\PermanentAiProviderException;
+use App\Exceptions\TaskTitleReadinessException;
+use App\Models\Task;
+use App\Models\TaskRun;
+use App\Models\WorkerHeartbeat;
+use App\Services\GeoFlow\AiExecutionContextFactory;
+use App\Services\GeoFlow\JobQueueService;
+use App\Services\GeoFlow\WorkerExecutionService;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Queue\Queueable;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Facades\Log;
+use Throwable;
+
+/**
+ * Laravel 队列任务：执行一条 task_runs 记录。
+ *
+ * 设计目标：
+ * 1. 完全使用 Laravel Queue + Redis 作为调度执行链路；
+ * 2. 用 Laravel Queue 承担调度与执行，不再依赖 while(true) 扫描；
+ * 3. 继续回写 task_runs / tasks / worker_heartbeats，保证后台面板可追踪。
+ */
+class ProcessGeoFlowTaskJob implements ShouldQueue
+{
+    use Queueable;
+
+    /**
+     * 为避免与业务重试策略双重重试冲突，Laravel 层固定单次执行；
+     * 业务重试由 JobQueueService::failJob 回写并二次 dispatch。
+     */
+    public int $tries = 1;
+
+    /**
+     * 单次执行超时（秒）。
+     */
+    public int $timeout = 300;
+
+    private ?AiExecutionContext $executionContext = null;
+
+    private ?string $claimedExecutionLeaseToken = null;
+
+    public function __construct(
+        public readonly int $taskRunId,
+        public readonly ?string $claimLeaseToken = null,
+    ) {}
+
+    /**
+     * 为 Horizon 监控提供稳定标签，便于按任务维度聚合队列表现。
+     *
+     * @return array<int,string>
+     */
+    public function tags(): array
+    {
+        $run = TaskRun::query()->whereKey($this->taskRunId)->first(['task_id']);
+        $taskId = (int) ($run?->task_id ?? 0);
+
+        return array_values(array_filter([
+            'geoflow',
+            'task_run:'.$this->taskRunId,
+            $taskId > 0 ? 'task:'.$taskId : null,
+        ]));
+    }
+
+    public function handle(
+        JobQueueService $queueService,
+        WorkerExecutionService $workerExecutionService,
+        ?AiExecutionContextFactory $contextFactory = null,
+    ): void {
+        $workerId = gethostname().':queue:'.getmypid();
+        $job = $queueService->claimPendingJobById(
+            $this->taskRunId,
+            $workerId,
+            $this->claimLeaseToken,
+        );
+        if (! is_array($job)) {
+            return;
+        }
+
+        $taskId = (int) Arr::get($job, 'task_id', 0);
+        if ($taskId <= 0) {
+            return;
+        }
+        $run = TaskRun::query()->whereKey($this->taskRunId)->first();
+        $context = null;
+        if ($run instanceof TaskRun) {
+            $this->claimedExecutionLeaseToken = trim((string) $run->execution_lease_token);
+            if ($run->model_access_admin_id !== null) {
+                try {
+                    $context = ($contextFactory ?? app(AiExecutionContextFactory::class))->fromTaskRun($run);
+                    $this->executionContext = $context;
+                } catch (AiModelAccessException) {
+                    // WorkerExecutionService only permits a missing context for model-free work,
+                    // such as publishing an already generated approved draft.
+                    $context = null;
+                }
+            }
+        }
+
+        $this->heartbeat($workerId, 'running', [
+            'pid' => getmypid(),
+            'task_id' => $taskId,
+            'stage' => 'claimed',
+            'task_run_id' => $this->taskRunId,
+        ]);
+
+        $startedAt = microtime(true);
+        try {
+            $result = $context === null
+                ? $workerExecutionService->executeTask($taskId)
+                : $workerExecutionService->executeTask($taskId, $context);
+            $durationMs = (int) round((microtime(true) - $startedAt) * 1000);
+
+            $alreadyCompleted = $context instanceof AiExecutionContext
+                && TaskRun::query()
+                    ->whereKey($this->taskRunId)
+                    ->where('status', 'completed')
+                    ->exists();
+            if (! $alreadyCompleted) {
+                $queueService->completeJob(
+                    jobId: $this->taskRunId,
+                    taskId: $taskId,
+                    articleId: Arr::get($result, 'article_id') !== null ? (int) Arr::get($result, 'article_id') : null,
+                    durationMs: $durationMs,
+                    meta: is_array(Arr::get($result, 'meta')) ? Arr::get($result, 'meta') : [],
+                    executionContext: $context,
+                    executionLeaseToken: $this->effectiveExecutionLeaseToken(),
+                    rejectStaleExecution: $context instanceof AiExecutionContext,
+                );
+            }
+        } catch (AiModelAccessException $exception) {
+            $durationMs = (int) round((microtime(true) - $startedAt) * 1000);
+            $queueService->failForAiAuthorization(
+                $this->taskRunId,
+                $taskId,
+                $exception->getErrorCode(),
+                $durationMs,
+                $context,
+                $this->effectiveExecutionLeaseToken(),
+            );
+        } catch (PermanentAiProviderException $exception) {
+            $durationMs = (int) round((microtime(true) - $startedAt) * 1000);
+            $queueService->failForPermanentAiProviderError(
+                $this->taskRunId,
+                $taskId,
+                $exception->getErrorCode(),
+                $durationMs,
+                $context,
+                $this->effectiveExecutionLeaseToken(),
+            );
+        } catch (TaskTitleReadinessException $exception) {
+            $durationMs = (int) round((microtime(true) - $startedAt) * 1000);
+            try {
+                $queueService->failForTaskConfiguration(
+                    $this->taskRunId,
+                    $taskId,
+                    $exception->getMessage(),
+                    $durationMs,
+                    $exception->getDetails()['title_readiness'] ?? [],
+                    $context,
+                    $this->effectiveExecutionLeaseToken(),
+                );
+            } catch (Throwable $persistenceException) {
+                Log::warning('GeoFlow task configuration failure could not be persisted.', [
+                    'task_run_id' => $this->taskRunId,
+                    'exception_type' => $persistenceException::class,
+                ]);
+
+                throw $exception;
+            }
+        } catch (Throwable $exception) {
+            $durationMs = (int) round((microtime(true) - $startedAt) * 1000);
+            $message = $exception->getMessage();
+
+            if ($this->shouldCancel($taskId, $message)) {
+                $queueService->cancelJob(
+                    $this->taskRunId,
+                    $taskId,
+                    '管理员手动停止',
+                    $context,
+                    $this->effectiveExecutionLeaseToken(),
+                );
+            } else {
+                $queueService->failJob(
+                    $this->taskRunId,
+                    $taskId,
+                    $message,
+                    $durationMs,
+                    executionContext: $context,
+                    executionLeaseToken: $this->effectiveExecutionLeaseToken(),
+                );
+            }
+        } finally {
+            $this->heartbeat($workerId, 'idle', [
+                'pid' => getmypid(),
+                'last_task_run_id' => $this->taskRunId,
+            ]);
+        }
+    }
+
+    /**
+     * Worker 超时、进程被杀死或 handle 未捕获的异常时由框架回调，避免 task_runs 永久停在 running。
+     *
+     * 与 handle() 内 catch 中的 failJob 互斥：仅当记录仍为 running 时才回写，防止重复扣减重试次数。
+     */
+    public function failed(?Throwable $exception = null): void
+    {
+        try {
+            $run = TaskRun::query()->whereKey($this->taskRunId)->first(['id', 'task_id', 'status']);
+            if (! $run || ($run->status ?? '') !== 'running') {
+                return;
+            }
+
+            $message = $exception !== null ? trim($exception->getMessage()) : '';
+            if ($message === '') {
+                $message = '队列任务异常退出';
+            }
+
+            $queueService = app(JobQueueService::class);
+            $context = $this->executionContext;
+            if (! $context instanceof AiExecutionContext
+                && $this->effectiveExecutionLeaseToken() === null
+                && ((bool) config('geoflow.admin_ai_access.access_enforce_enabled', false)
+                    || (bool) config('geoflow.admin_ai_access.revocation_enforce_enabled', false))) {
+                return;
+            }
+            if ($exception instanceof AiModelAccessException) {
+                $queueService->failForAiAuthorization(
+                    (int) $run->id,
+                    (int) $run->task_id,
+                    $exception->getErrorCode(),
+                    0,
+                    $context,
+                    $this->effectiveExecutionLeaseToken(),
+                );
+
+                return;
+            }
+            if ($exception instanceof PermanentAiProviderException) {
+                $queueService->failForPermanentAiProviderError(
+                    (int) $run->id,
+                    (int) $run->task_id,
+                    $exception->getErrorCode(),
+                    0,
+                    $context,
+                    $this->effectiveExecutionLeaseToken(),
+                );
+
+                return;
+            }
+            if ($exception instanceof TaskTitleReadinessException) {
+                $queueService->failForTaskConfiguration(
+                    (int) $run->id,
+                    (int) $run->task_id,
+                    $exception->getMessage(),
+                    0,
+                    $exception->getDetails()['title_readiness'] ?? [],
+                    $context,
+                    $this->effectiveExecutionLeaseToken(),
+                );
+
+                return;
+            }
+
+            $queueService->failJob(
+                (int) $run->id,
+                (int) $run->task_id,
+                '队列中断: '.$message,
+                0,
+                executionContext: $context,
+                executionLeaseToken: $this->effectiveExecutionLeaseToken(),
+            );
+        } catch (Throwable) {
+            // 避免失败回调自身再抛错导致 Horizon 日志刷屏
+        }
+    }
+
+    private function effectiveExecutionLeaseToken(): ?string
+    {
+        $token = trim((string) ($this->claimedExecutionLeaseToken ?? $this->claimLeaseToken));
+
+        return $token !== '' ? $token : null;
+    }
+
+    /**
+     * 取消判定：
+     * - 任务已停用；
+     * - 异常文本明确为手动停止/任务未激活。
+     */
+    private function shouldCancel(int $taskId, string $message): bool
+    {
+        if (str_contains($message, '管理员手动停止') || str_contains($message, '任务未激活')) {
+            return true;
+        }
+
+        $task = Task::query()->whereKey($taskId)->first(['status', 'schedule_enabled']);
+        if (! $task) {
+            return true;
+        }
+
+        return ($task->status ?? 'paused') !== 'active' || (int) ($task->schedule_enabled ?? 1) !== 1;
+    }
+
+    /**
+     * 写队列 worker 心跳（兼容原任务页运行面板）。
+     *
+     * @param  array<string,mixed>  $meta
+     */
+    private function heartbeat(string $workerId, string $status, array $meta): void
+    {
+        try {
+            $meta['memory_mb'] = round(memory_get_usage(true) / 1024 / 1024, 2);
+            $meta['peak_memory_mb'] = round(memory_get_peak_usage(true) / 1024 / 1024, 2);
+            WorkerHeartbeat::query()->updateOrCreate(
+                ['worker_id' => $workerId],
+                [
+                    'status' => $status,
+                    'last_seen_at' => now(),
+                    'meta' => $meta,
+                ]
+            );
+        } catch (Throwable) {
+            // 心跳表异常不阻塞生成链路，否则 task_runs 会卡在 running 且无法进入 fail/complete
+        }
+    }
+}

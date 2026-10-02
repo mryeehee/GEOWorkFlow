@@ -1,0 +1,18 @@
+{
+  "version": "3.2.0-beta.1",
+  "tag": "v3.2.0-beta.1",
+  "release_date": "2026-09-16",
+  "release_type": "minor",
+  "archive_url": "https://github.com/mryeehee/GEOWorkFlow/releases/download/v3.2.0-beta.1/GEOWorkFlow-v3.2.0-beta.1.zip",
+  "payload": {
+    "title_zh": "GEOWorkFlow v3.2.0-beta.1",
+    "title_en": "GEOWorkFlow v3.2.0-beta.1",
+    "summary_zh": "GEOWorkFlow 3.2.0-beta.1 增加独立远程管理 CLI、站点主题草稿增量编辑与真实内容预览，并与 Updater 协同提供可恢复的操作收据、恢复代次、凭据失效和任务隔离保护。",
+    "summary_en": "GEOWorkFlow 3.2.0-beta.1 adds the standalone remote management CLI, incremental site-theme draft editing with real-content previews, and coordinated Updater safeguards for durable receipts, recovery epochs, credential invalidation, and task isolation.",
+    "upgrade_tip_zh": "本预览版仅用于开发与隔离测试，尚未完成正式签名分发、原生双架构恢复演练或生产部署验收。配套使用 CLI 0.4.0-preview.1、Skill 1.2.0-preview.1，以及声明兼容本 Core 契约的 Updater 构建。已受管实例继续保持恢复限制，先查询原操作收据并完成逐业务对账；响应不确定时不要自动重发。主题草稿编辑与预览已开放，主题发布和回滚仍待后续版本。生产环境继续使用最新稳定版 3.1.0。",
+    "upgrade_tip_en": "This preview is for development and isolated testing only. Official signed distribution, native dual-architecture recovery rehearsals, and production deployment acceptance are not complete. Use CLI 0.4.0-preview.1, Skill 1.2.0-preview.1, and an Updater build that declares compatibility with this Core contract. Keep managed instances held after recovery, query the original operation receipt, and complete per-domain reconciliation; do not automatically resend uncertain requests. Theme draft editing and preview are available, while theme publication and rollback remain pending. Production environments should continue using the latest stable 3.1.0 release.",
+    "release_url": "https://github.com/mryeehee/GEOWorkFlow/releases/tag/v3.2.0-beta.1",
+    "changelog_url_zh": "https://github.com/mryeehee/GEOWorkFlow/blob/v3.2.0-beta.1/docs/CHANGELOG.md",
+    "changelog_url_en": "https://github.com/mryeehee/GEOWorkFlow/blob/v3.2.0-beta.1/docs/CHANGELOG_en.md"
+  }
+}

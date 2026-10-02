@@ -1,0 +1,2239 @@
+<?php
+
+namespace App\Http\Controllers\Admin;
+
+use App\Exceptions\DistributionChannelDeletionBlocked;
+use App\Http\Controllers\Controller;
+use App\Http\Requests\Admin\DeleteDistributionChannelRequest;
+use App\Jobs\ProcessArticleDistributionJob;
+use App\Models\Admin;
+use App\Models\Article;
+use App\Models\ArticleDistribution;
+use App\Models\DistributionChannel;
+use App\Models\DistributionChannelSecret;
+use App\Models\DistributionLog;
+use App\Models\LeadForm;
+use App\Models\ManualPublicationPersona;
+use App\Models\Task;
+use App\Services\GeoFlow\ArticleCitationMarkerCleaner;
+use App\Services\GeoFlow\DistributionChannelDeletionConfirmation;
+use App\Services\GeoFlow\DistributionChannelDeletionService;
+use App\Services\GeoFlow\DistributionChannelOperationLeaseService;
+use App\Services\GeoFlow\DistributionOrchestrator;
+use App\Services\GeoFlow\DistributionPublisherManager;
+use App\Services\GeoFlow\DistributionTargetSitePackageBuilder;
+use App\Services\GeoFlow\FrontendExperienceInspector;
+use App\Services\HostedSites\HostedSiteArticleFingerprintService;
+use App\Support\AdminWeb;
+use App\Support\GeoFlow\ApiKeyCrypto;
+use App\Support\GeoFlow\CnPlatformRegistry;
+use App\Support\Site\ArticleTextAdPicker;
+use App\Support\Site\HomepageModuleBuilder;
+use App\Support\Site\SiteSettingsBag;
+use App\Support\Site\SiteThemeCatalog;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Str;
+use Illuminate\Validation\ValidationException;
+use Illuminate\View\View;
+use Symfony\Component\HttpFoundation\StreamedResponse;
+use Throwable;
+
+class DistributionController extends Controller
+{
+    public function __construct(
+        private readonly DistributionOrchestrator $distributionOrchestrator,
+        private readonly DistributionPublisherManager $publisherManager,
+        private readonly ApiKeyCrypto $apiKeyCrypto,
+        private readonly DistributionTargetSitePackageBuilder $targetSitePackageBuilder,
+        private readonly SiteThemeCatalog $siteThemeCatalog,
+        private readonly FrontendExperienceInspector $frontendExperienceInspector,
+        private readonly DistributionChannelDeletionService $channelDeletionService,
+        private readonly DistributionChannelOperationLeaseService $channelOperationLeaseService,
+        private readonly HostedSiteArticleFingerprintService $hostedFingerprints,
+        private readonly ArticleCitationMarkerCleaner $articleCitationMarkerCleaner,
+    ) {}
+
+    public function index(Request $request): View
+    {
+        $channels = DistributionChannel::query()
+            ->with('activeSecret')
+            ->withCount([
+                'articleDistributions as pending_count' => fn ($query) => $query->whereIn('status', ['queued', 'sending']),
+                'articleDistributions as failed_count' => fn ($query) => $query->whereIn('status', ['failed', 'outcome_unknown']),
+            ])
+            ->orderByDesc('id')
+            ->get();
+
+        $stats = [
+            'total' => DistributionChannel::query()->count(),
+            'active' => DistributionChannel::query()->where('status', 'active')->count(),
+            'pending' => ArticleDistribution::query()->whereIn('status', ['queued', 'sending'])->count(),
+            'failed' => ArticleDistribution::query()->whereIn('status', ['failed', 'outcome_unknown'])->count(),
+        ];
+
+        $defaultSiteFormStats = Schema::hasTable('lead_forms')
+            ? LeadForm::query()
+                ->selectRaw(
+                    'COUNT(*) as total, SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) as active',
+                    [LeadForm::STATUS_ACTIVE]
+                )
+                ->first()
+            : null;
+        $defaultSite = [
+            'name' => SiteSettingsBag::get('site_name', (string) config('geoflow.site_name', 'GEOWorkFlow')),
+            'url' => route('site.home'),
+            'published_articles' => Article::query()->published()->count(),
+            'forms_total' => (int) ($defaultSiteFormStats?->total ?? 0),
+            'forms_active' => (int) ($defaultSiteFormStats?->active ?? 0),
+        ];
+
+        $logsQuery = DistributionLog::query()
+            ->with('channel:id,name')
+            ->with('article:id,title,slug')
+            ->orderByDesc('id');
+        $logsPerPage = 10;
+        $logsTotal = (clone $logsQuery)->count();
+        $logsLastPage = max(1, (int) ceil($logsTotal / $logsPerPage));
+        $logsPage = min(
+            max(1, (int) $request->query('logs_page', 1)),
+            $logsLastPage
+        );
+        $logs = $logsQuery
+            ->paginate($logsPerPage, ['*'], 'logs_page', $logsPage)
+            ->withQueryString();
+
+        return view('admin.distribution.index', [
+            'pageTitle' => __('admin.distribution.page_title'),
+            'activeMenu' => 'distribution',
+            'adminSiteName' => AdminWeb::siteName(),
+            'channels' => $channels,
+            'defaultSite' => $defaultSite,
+            'channelSyncSummaries' => $channels
+                ->mapWithKeys(fn (DistributionChannel $channel): array => [(int) $channel->id => $this->frontendExperienceInspector->syncSummary($channel)])
+                ->all(),
+            'stats' => $stats,
+            'logs' => $logs,
+        ]);
+    }
+
+    public function create(): View
+    {
+        return view('admin.distribution.create', [
+            'pageTitle' => __('admin.distribution.create_title'),
+            'activeMenu' => 'distribution',
+            'adminSiteName' => AdminWeb::siteName(),
+            'availableThemes' => $this->siteThemeCatalog->all(),
+            'cnPlatformPresets' => CnPlatformRegistry::sortedPresets(),
+            'cnPersonas' => ManualPublicationPersona::query()->where('is_active', true)->orderBy('id')->get(),
+        ]);
+    }
+
+    public function store(Request $request): RedirectResponse
+    {
+        $payload = $this->validateChannel($request);
+
+        $channel = DistributionChannel::query()->create([
+            'name' => (string) $payload['name'],
+            'domain' => $this->normalizeDomain((string) $payload['domain']),
+            'endpoint_url' => (string) $payload['endpoint_url'],
+            'channel_type' => (string) $payload['channel_type'],
+            'front_mode' => (string) ($payload['front_mode'] ?? 'static'),
+            'template_key' => filled($payload['template_key'] ?? null) ? (string) $payload['template_key'] : null,
+            'site_settings' => $this->normalizeChannelSiteSettings($payload),
+            'channel_config' => $this->normalizeChannelConfig($payload),
+            'status' => (string) $payload['status'],
+            'description' => filled($payload['description'] ?? null) ? (string) $payload['description'] : null,
+            'created_by_admin_id' => auth('admin')->id(),
+        ]);
+
+        if ($channel->isWordPressRest()) {
+            $this->createWordPressSecret($channel, (string) $payload['wordpress_application_password']);
+
+            return redirect()
+                ->route('admin.distribution.index')
+                ->with('message', __('admin.distribution.message.created'));
+        }
+
+        if ($channel->isGenericHttpApi()) {
+            if ($channel->resolvedGenericHttpConfig()['generic_auth_type'] !== 'none') {
+                $this->createGenericHttpSecret($channel, (string) $payload['generic_secret']);
+            }
+
+            return redirect()
+                ->route('admin.distribution.show', ['channelId' => (int) $channel->id])
+                ->with('message', __('admin.distribution.message.created'));
+        }
+
+        if ($channel->isCnPlatform()) {
+            $this->replaceCnPlatformSecret($channel, $payload);
+
+            return redirect()
+                ->route('admin.distribution.show', ['channelId' => (int) $channel->id])
+                ->with('message', __('admin.distribution.message.created'));
+        }
+
+        $secret = $this->createChannelSecret($channel);
+
+        return redirect()
+            ->route('admin.distribution.index')
+            ->with('message', __('admin.distribution.message.created'))
+            ->with('distribution_secret', [
+                'key_id' => $secret['key_id'],
+                'secret' => $secret['secret'],
+                'endpoint_url' => (string) $payload['endpoint_url'],
+            ]);
+    }
+
+    public function edit(int $channelId): View|RedirectResponse
+    {
+        $channel = DistributionChannel::query()
+            ->with('activeSecret')
+            ->whereKey($channelId)
+            ->first();
+        if (! $channel) {
+            return redirect()->route('admin.distribution.index')->withErrors(__('admin.distribution.message.not_found'));
+        }
+        if ($redirect = $this->hostedSiteRedirect($channel)) {
+            return $redirect;
+        }
+        if ($redirect = $this->deletingChannelRedirect($channel)) {
+            return $redirect;
+        }
+
+        return view('admin.distribution.edit', [
+            'pageTitle' => __('admin.distribution.edit_title'),
+            'activeMenu' => 'distribution',
+            'adminSiteName' => AdminWeb::siteName(),
+            'channel' => $channel,
+            'cnPlatformPresets' => CnPlatformRegistry::sortedPresets(),
+            'cnPersonas' => ManualPublicationPersona::query()->where('is_active', true)->orderBy('id')->get(),
+            'remoteSiteSettings' => $channel->resolvedSiteSettings(),
+            'availableThemes' => $this->siteThemeCatalog->all(),
+            'articleDetailTextAds' => ArticleTextAdPicker::all(false),
+            'articleTextAdPolicy' => $channel->resolvedArticleTextAdPolicy(),
+            'frontendExperienceMode' => $channel->frontendExperienceMode(),
+            'frontendExperienceModes' => DistributionChannel::frontendExperienceModes(),
+            'frontendExperienceReport' => $this->frontendExperienceInspector->inspect($channel, true),
+        ]);
+    }
+
+    public function update(Request $request, int $channelId): RedirectResponse
+    {
+        $channel = DistributionChannel::query()->whereKey($channelId)->first();
+        if (! $channel) {
+            return redirect()->route('admin.distribution.index')->withErrors(__('admin.distribution.message.not_found'));
+        }
+        if ($redirect = $this->hostedSiteRedirect($channel)) {
+            return $redirect;
+        }
+        if ($redirect = $this->deletingChannelRedirect($channel)) {
+            return $redirect;
+        }
+
+        $payload = $this->validateChannel($request);
+        $payload['channel_type'] = $channel->channelType();
+        try {
+            $channel = DB::transaction(function () use ($channelId, $payload): ?DistributionChannel {
+                $lockedChannel = DistributionChannel::query()
+                    ->whereKey($channelId)
+                    ->lockForUpdate()
+                    ->first();
+                if (! $lockedChannel) {
+                    return null;
+                }
+                if ((string) $lockedChannel->status === DistributionChannel::STATUS_DELETING) {
+                    throw new DistributionChannelDeletionBlocked('operation_blocked');
+                }
+                $this->channelOperationLeaseService->assertNoActiveLease($lockedChannel);
+
+                if (($payload['channel_type'] ?? 'geoflow_agent') === 'generic_http_api') {
+                    $genericAuthType = (string) ($payload['generic_auth_type'] ?? 'bearer');
+                    $hasActiveSecret = DistributionChannelSecret::query()
+                        ->where('distribution_channel_id', (int) $lockedChannel->id)
+                        ->where('status', 'active')
+                        ->exists();
+                    if ($genericAuthType !== 'none' && ! $hasActiveSecret && ! filled($payload['generic_secret'] ?? null)) {
+                        throw ValidationException::withMessages([
+                            'generic_secret' => __('admin.distribution.validation.generic_secret'),
+                        ]);
+                    }
+                }
+
+                $lockedChannel->forceFill([
+                    'name' => (string) $payload['name'],
+                    'domain' => $this->normalizeDomain((string) $payload['domain']),
+                    'endpoint_url' => (string) $payload['endpoint_url'],
+                    'channel_type' => (string) $payload['channel_type'],
+                    'front_mode' => (string) ($payload['front_mode'] ?? 'static'),
+                    'template_key' => filled($payload['template_key'] ?? null) ? (string) $payload['template_key'] : null,
+                    'site_settings' => $this->normalizeChannelSiteSettings($payload, $lockedChannel),
+                    'channel_config' => $this->normalizeChannelConfig($payload, $lockedChannel),
+                    'status' => (string) $payload['status'],
+                    'description' => filled($payload['description'] ?? null) ? (string) $payload['description'] : null,
+                ])->save();
+
+                if ($lockedChannel->isWordPressRest() && filled($payload['wordpress_application_password'] ?? null)) {
+                    DistributionChannelSecret::query()
+                        ->where('distribution_channel_id', (int) $lockedChannel->id)
+                        ->where('status', 'active')
+                        ->update(['status' => 'revoked']);
+                    $this->createWordPressSecret($lockedChannel, (string) $payload['wordpress_application_password']);
+                }
+                if ($lockedChannel->isCnPlatform()) {
+                    $this->replaceCnPlatformSecret($lockedChannel, $payload);
+
+                    return $lockedChannel->fresh();
+                }
+                if (! $lockedChannel->isGenericHttpApi()) {
+                    return $lockedChannel->fresh();
+                }
+
+                $genericAuthType = $lockedChannel->resolvedGenericHttpConfig()['generic_auth_type'];
+                if ($genericAuthType === 'none') {
+                    DistributionChannelSecret::query()
+                        ->where('distribution_channel_id', (int) $lockedChannel->id)
+                        ->where('status', 'active')
+                        ->update(['status' => 'revoked']);
+                } elseif (filled($payload['generic_secret'] ?? null)) {
+                    DistributionChannelSecret::query()
+                        ->where('distribution_channel_id', (int) $lockedChannel->id)
+                        ->where('status', 'active')
+                        ->update(['status' => 'revoked']);
+                    $this->createGenericHttpSecret($lockedChannel, (string) $payload['generic_secret']);
+                }
+
+                return $lockedChannel->fresh();
+            });
+        } catch (DistributionChannelDeletionBlocked $exception) {
+            return $this->channelMutationBlockedResponse($channelId, $exception);
+        }
+
+        if (! $channel) {
+            return redirect()->route('admin.distribution.index')->withErrors(__('admin.distribution.message.not_found'));
+        }
+
+        $message = __('admin.distribution.message.updated');
+        $channel->load('activeSecret');
+        if (! $channel->isCnPlatform() && ($channel->activeSecret || ($channel->isGenericHttpApi() && $channel->resolvedGenericHttpConfig()['generic_auth_type'] === 'none'))) {
+            if ($channel->isGeoFlowAgent() && $this->frontendExperienceInspector->requiresSyncConfirmation($channel)) {
+                return redirect()
+                    ->route('admin.distribution.show', ['channelId' => (int) $channel->id])
+                    ->with('message', $message)
+                    ->withErrors('设置已保存。同步前需要先通过前台体验预览确认风险。');
+            }
+
+            try {
+                $this->syncChannelSiteSettings($channel);
+                $message = __('admin.distribution.message.updated_and_settings_synced');
+            } catch (Throwable $e) {
+                return redirect()
+                    ->route('admin.distribution.show', ['channelId' => (int) $channel->id])
+                    ->with('message', $message)
+                    ->withErrors(__('admin.distribution.message.settings_sync_failed', ['message' => $e->getMessage()]));
+            }
+        }
+
+        return redirect()
+            ->route('admin.distribution.show', ['channelId' => (int) $channel->id])
+            ->with('message', $message);
+    }
+
+    public function show(int $channelId): View|RedirectResponse
+    {
+        $channel = DistributionChannel::query()
+            ->with('activeSecret')
+            ->whereKey($channelId)
+            ->first();
+
+        if (! $channel) {
+            return redirect()->route('admin.distribution.index')->withErrors(__('admin.distribution.message.not_found'));
+        }
+        if ($redirect = $this->hostedSiteRedirect($channel)) {
+            return $redirect;
+        }
+
+        $jobs = ArticleDistribution::query()
+            ->with('article:id,title,slug,status')
+            ->where('distribution_channel_id', $channelId)
+            ->orderByDesc('id')
+            ->limit(20)
+            ->get();
+
+        $logs = DistributionLog::query()
+            ->with('article:id,title,slug')
+            ->where('distribution_channel_id', $channelId)
+            ->orderByDesc('id')
+            ->limit(20)
+            ->get();
+
+        return view('admin.distribution.show', [
+            'pageTitle' => __('admin.distribution.detail_title'),
+            'activeMenu' => 'distribution',
+            'adminSiteName' => AdminWeb::siteName(),
+            'channel' => $channel,
+            'jobs' => $jobs,
+            'logs' => $logs,
+            'remoteSiteSettings' => $channel->resolvedSiteSettings(),
+            'articleTextAdPolicy' => $channel->resolvedArticleTextAdPolicy(),
+            'effectiveArticleTextAds' => $channel->effectiveArticleTextAds(),
+            'frontendExperienceReport' => $this->frontendExperienceInspector->inspect($channel, true),
+        ]);
+    }
+
+    public function deletePreview(int $channelId): View|RedirectResponse
+    {
+        $channel = DistributionChannel::query()->whereKey($channelId)->first();
+        if (! $channel) {
+            return redirect()->route('admin.distribution.index')->withErrors(__('admin.distribution.message.not_found'));
+        }
+        if (! $this->channelDeletionService->isSchemaReady()) {
+            return redirect()
+                ->route('admin.distribution.show', ['channelId' => $channelId])
+                ->withErrors(['distribution' => __('admin.distribution.delete.blocked.migration_required')]);
+        }
+
+        return view('admin.distribution.delete', [
+            'pageTitle' => __('admin.distribution.delete.page_title'),
+            'activeMenu' => 'distribution',
+            'adminSiteName' => AdminWeb::siteName(),
+            'channel' => $channel,
+            'impact' => $this->channelDeletionService->inspect($channel),
+        ]);
+    }
+
+    public function prepareDelete(int $channelId): RedirectResponse
+    {
+        $channel = DistributionChannel::query()->whereKey($channelId)->first();
+        if (! $channel) {
+            return redirect()->route('admin.distribution.index')->withErrors(__('admin.distribution.message.not_found'));
+        }
+        if (! $this->channelDeletionService->isSchemaReady()) {
+            return redirect()
+                ->route('admin.distribution.show', ['channelId' => $channelId])
+                ->withErrors(['distribution' => __('admin.distribution.delete.blocked.migration_required')]);
+        }
+
+        try {
+            $this->channelDeletionService->prepare($channel);
+        } catch (DistributionChannelDeletionBlocked $exception) {
+            $messageKey = 'admin.distribution.delete.blocked.'.$exception->reason;
+
+            return back()->withErrors(trans()->has($messageKey) ? __($messageKey) : __('admin.distribution.delete.blocked.default'));
+        }
+
+        return redirect()
+            ->route('admin.distribution.delete', ['channelId' => $channelId])
+            ->with('message', __('admin.distribution.delete.message.prepared'));
+    }
+
+    public function cancelDelete(int $channelId): RedirectResponse
+    {
+        $channel = DistributionChannel::query()->whereKey($channelId)->first();
+        if (! $channel) {
+            return redirect()->route('admin.distribution.index')->withErrors(__('admin.distribution.message.not_found'));
+        }
+
+        $this->channelDeletionService->cancel($channel);
+
+        return redirect()
+            ->route('admin.distribution.show', ['channelId' => $channelId])
+            ->with('message', __('admin.distribution.delete.message.cancelled'));
+    }
+
+    public function destroy(DeleteDistributionChannelRequest $request, int $channelId): RedirectResponse
+    {
+        $channel = $request->channel();
+        if (! $channel) {
+            return redirect()->route('admin.distribution.index')->withErrors(__('admin.distribution.message.not_found'));
+        }
+        if (! $this->channelDeletionService->isSchemaReady()) {
+            return redirect()
+                ->route('admin.distribution.show', ['channelId' => $channelId])
+                ->withErrors(['distribution' => __('admin.distribution.delete.blocked.migration_required')]);
+        }
+
+        /** @var Admin $admin */
+        $admin = auth('admin')->user();
+        try {
+            $this->channelDeletionService->delete(
+                $channel,
+                $admin,
+                new DistributionChannelDeletionConfirmation(
+                    impactFingerprint: (string) $request->input('impact_fingerprint'),
+                    ackRemoteContent: $request->boolean('ack_remote_content'),
+                    ackTaskChanges: $request->boolean('ack_task_changes'),
+                    ackCredentials: $request->boolean('ack_credentials'),
+                    ackHistory: $request->boolean('ack_history'),
+                    forceStaleSending: $request->boolean('force_stale_sending'),
+                    forceStaleOperations: $request->boolean('force_stale_operations'),
+                ),
+            );
+        } catch (DistributionChannelDeletionBlocked $exception) {
+            $messageKey = 'admin.distribution.delete.blocked.'.$exception->reason;
+
+            return back()->withErrors(trans()->has($messageKey) ? __($messageKey) : __('admin.distribution.delete.blocked.default'));
+        }
+
+        return redirect()
+            ->route('admin.distribution.index')
+            ->with('message', __('admin.distribution.delete.message.deleted', ['channel' => (string) $channel->name]));
+    }
+
+    public function jobs(Request $request): View
+    {
+        $filters = [
+            'status' => (string) $request->query('status', ''),
+            'channel_id' => max(0, (int) $request->query('channel_id', 0)),
+        ];
+        if (! in_array($filters['status'], ['queued', 'sending', 'synced', 'failed', 'outcome_unknown'], true)) {
+            $filters['status'] = '';
+        }
+
+        $query = ArticleDistribution::query()
+            ->with(['article:id,title,slug,status', 'channel:id,name,domain']);
+
+        if ($filters['status'] !== '') {
+            $query->where('status', $filters['status']);
+        }
+        if ($filters['channel_id'] > 0) {
+            $query->where('distribution_channel_id', $filters['channel_id']);
+        }
+
+        $jobs = $query->orderByDesc('id')->paginate(20)->withQueryString();
+        $channels = DistributionChannel::query()
+            ->select(['id', 'name', 'domain'])
+            ->orderBy('name')
+            ->get();
+
+        return view('admin.distribution.jobs', [
+            'pageTitle' => __('admin.distribution.jobs_title'),
+            'activeMenu' => 'distribution',
+            'adminSiteName' => AdminWeb::siteName(),
+            'jobs' => $jobs,
+            'channels' => $channels,
+            'filters' => $filters,
+        ]);
+    }
+
+    public function pause(int $channelId): RedirectResponse
+    {
+        return $this->setStatus($channelId, 'paused', __('admin.distribution.message.paused'));
+    }
+
+    public function activate(int $channelId): RedirectResponse
+    {
+        return $this->setStatus($channelId, 'active', __('admin.distribution.message.activated'));
+    }
+
+    public function rotateSecret(int $channelId): RedirectResponse
+    {
+        $candidate = DistributionChannel::query()->whereKey($channelId)->first();
+        if ($candidate && ($redirect = $this->hostedSiteRedirect($candidate))) {
+            return $redirect;
+        }
+
+        try {
+            $result = DB::transaction(function () use ($channelId): ?array {
+                $channel = DistributionChannel::query()
+                    ->whereKey($channelId)
+                    ->lockForUpdate()
+                    ->first();
+                if (! $channel) {
+                    return null;
+                }
+                if ((string) $channel->status === DistributionChannel::STATUS_DELETING) {
+                    throw new DistributionChannelDeletionBlocked('operation_blocked');
+                }
+                $this->channelOperationLeaseService->assertNoActiveLease($channel);
+                if (! $channel->isGeoFlowAgent()) {
+                    throw ValidationException::withMessages([
+                        'channel' => __('admin.distribution.message.secret_rotation_not_available'),
+                    ]);
+                }
+
+                DistributionChannelSecret::query()
+                    ->where('distribution_channel_id', (int) $channel->id)
+                    ->where('status', 'active')
+                    ->update(['status' => 'revoked']);
+
+                return [$channel, $this->createChannelSecret($channel)];
+            });
+        } catch (DistributionChannelDeletionBlocked $exception) {
+            return $this->channelMutationBlockedResponse($channelId, $exception);
+        }
+
+        if (! $result) {
+            return redirect()->route('admin.distribution.index')->withErrors(__('admin.distribution.message.not_found'));
+        }
+        [$channel, $secret] = $result;
+
+        return redirect()
+            ->route('admin.distribution.show', ['channelId' => (int) $channel->id])
+            ->with('message', __('admin.distribution.message.secret_rotated'))
+            ->with('distribution_secret', [
+                'key_id' => $secret['key_id'],
+                'secret' => $secret['secret'],
+                'endpoint_url' => (string) $channel->endpoint_url,
+            ]);
+    }
+
+    public function revealSecret(Request $request, int $channelId): RedirectResponse
+    {
+        $channel = DistributionChannel::query()
+            ->with('activeSecret')
+            ->whereKey($channelId)
+            ->first();
+        if (! $channel) {
+            return redirect()->route('admin.distribution.index')->withErrors(__('admin.distribution.message.not_found'));
+        }
+        if ($redirect = $this->hostedSiteRedirect($channel)) {
+            return $redirect;
+        }
+        if ($redirect = $this->deletingChannelRedirect($channel)) {
+            return $redirect;
+        }
+        if ($channel->isWordPressRest()) {
+            return back()->withErrors(__('admin.distribution.message.package_not_available_for_wordpress'));
+        }
+
+        /** @var Admin|null $admin */
+        $admin = auth('admin')->user();
+        if (! $admin instanceof Admin || ! $admin->isSuperAdmin()) {
+            return back()->withErrors([
+                'password' => __('admin.distribution.message.secret_reveal_forbidden'),
+            ]);
+        }
+
+        $payload = $request->validate([
+            'password' => ['required', 'string'],
+        ]);
+
+        if (! Hash::check((string) $payload['password'], (string) $admin->password)) {
+            return back()->withErrors([
+                'password' => __('admin.distribution.message.password_invalid'),
+            ]);
+        }
+
+        try {
+            $revealed = $this->channelOperationLeaseService->run(
+                $channel,
+                'secret_reveal',
+                function (DistributionChannel $lockedChannel): array {
+                    $lockedChannel->load('activeSecret');
+                    $secret = $lockedChannel->activeSecret;
+                    if (! $secret) {
+                        throw ValidationException::withMessages([
+                            'password' => __('admin.distribution.message.active_secret_not_found'),
+                        ]);
+                    }
+
+                    $plainSecret = $this->apiKeyCrypto->decrypt((string) $secret->secret_ciphertext);
+                    if ($plainSecret === '') {
+                        throw ValidationException::withMessages([
+                            'password' => __('admin.distribution.message.secret_decrypt_failed'),
+                        ]);
+                    }
+
+                    return ['key_id' => (string) $secret->key_id, 'secret' => $plainSecret];
+                },
+            );
+        } catch (DistributionChannelDeletionBlocked) {
+            return redirect()
+                ->route('admin.distribution.delete', ['channelId' => (int) $channel->id])
+                ->withErrors(__('admin.distribution.delete.operation_blocked'));
+        }
+
+        return redirect()
+            ->route('admin.distribution.show', ['channelId' => (int) $channel->id])
+            ->with('message', __('admin.distribution.message.secret_revealed'))
+            ->with('distribution_secret', [
+                'key_id' => $revealed['key_id'],
+                'secret' => $revealed['secret'],
+                'endpoint_url' => (string) $channel->endpoint_url,
+            ]);
+    }
+
+    public function downloadPackage(Request $request, int $channelId): StreamedResponse|RedirectResponse
+    {
+        $channel = DistributionChannel::query()
+            ->with('activeSecret')
+            ->whereKey($channelId)
+            ->first();
+        if (! $channel) {
+            return redirect()->route('admin.distribution.index')->withErrors(__('admin.distribution.message.not_found'));
+        }
+        if ($redirect = $this->hostedSiteRedirect($channel)) {
+            return $redirect;
+        }
+        if ($redirect = $this->deletingChannelRedirect($channel)) {
+            return $redirect;
+        }
+        if (! $channel->isGeoFlowAgent()) {
+            return back()->withErrors(__('admin.distribution.message.package_not_available_for_channel_type'));
+        }
+
+        /** @var Admin|null $admin */
+        $admin = auth('admin')->user();
+        if (! $admin instanceof Admin || ! $admin->isSuperAdmin()) {
+            return back()->withErrors([
+                'package_password' => __('admin.distribution.message.package_download_forbidden'),
+            ]);
+        }
+
+        $payload = $request->validate([
+            'package_password' => ['required', 'string'],
+        ]);
+
+        if (! Hash::check((string) $payload['package_password'], (string) $admin->password)) {
+            return back()->withErrors([
+                'package_password' => __('admin.distribution.message.password_invalid'),
+            ]);
+        }
+
+        try {
+            $package = $this->channelOperationLeaseService->run(
+                $channel,
+                'package_build',
+                function (DistributionChannel $lockedChannel): array {
+                    $lockedChannel->load('activeSecret');
+                    $secret = $lockedChannel->activeSecret;
+                    if (! $secret) {
+                        throw ValidationException::withMessages([
+                            'package_password' => __('admin.distribution.message.active_secret_not_found'),
+                        ]);
+                    }
+
+                    $plainSecret = $this->apiKeyCrypto->decrypt((string) $secret->secret_ciphertext);
+                    if ($plainSecret === '') {
+                        throw ValidationException::withMessages([
+                            'package_password' => __('admin.distribution.message.secret_decrypt_failed'),
+                        ]);
+                    }
+
+                    return $this->targetSitePackageBuilder->build($lockedChannel, (string) $secret->key_id, $plainSecret);
+                },
+            );
+        } catch (DistributionChannelDeletionBlocked) {
+            return redirect()
+                ->route('admin.distribution.delete', ['channelId' => (int) $channel->id])
+                ->withErrors(__('admin.distribution.delete.operation_blocked'));
+        }
+
+        return response()->streamDownload(function () use ($package): void {
+            echo file_get_contents($package['path']) ?: '';
+            @unlink($package['path']);
+        }, $package['filename'], [
+            'Content-Type' => 'application/zip',
+        ]);
+    }
+
+    public function retry(int $distributionId): RedirectResponse
+    {
+        $candidate = ArticleDistribution::query()
+            ->select(['id', 'article_id', 'distribution_channel_id'])
+            ->whereKey($distributionId)
+            ->first();
+        if (! $candidate) {
+            return back()->withErrors(__('admin.distribution.message.job_not_found'));
+        }
+
+        $result = DB::transaction(function () use ($candidate): string {
+            $channel = DistributionChannel::query()
+                ->whereKey((int) $candidate->distribution_channel_id)
+                ->lockForUpdate()
+                ->first();
+            if (! $channel) {
+                return 'unavailable';
+            }
+            if ((string) $channel->status === DistributionChannel::STATUS_DELETING) {
+                return 'deleting';
+            }
+            if ((string) $channel->status !== DistributionChannel::STATUS_ACTIVE) {
+                return 'unavailable';
+            }
+            $taskId = (int) Article::query()->whereKey((int) $candidate->article_id)->value('task_id');
+            $task = $taskId ? Task::query()->whereKey($taskId)->lockForUpdate()->first(['id']) : null;
+            $article = Article::query()
+                ->whereKey((int) $candidate->article_id)
+                ->lockForUpdate()
+                ->first(['id', 'task_id']);
+            if (! $article) {
+                return 'article_unavailable';
+            }
+            if ((int) $article->task_id !== $taskId || ($taskId && ! $task)) {
+                return 'article_unavailable';
+            }
+            $distribution = ArticleDistribution::query()
+                ->whereKey((int) $candidate->id)
+                ->where('article_id', (int) $article->id)
+                ->where('distribution_channel_id', (int) $channel->id)
+                ->lockForUpdate()
+                ->first();
+            if (! $distribution) {
+                return 'missing';
+            }
+            if ((string) $distribution->status === 'sending') {
+                return 'sending';
+            }
+            if ((string) $distribution->status === 'outcome_unknown') {
+                return 'outcome_unknown';
+            }
+
+            $distribution->forceFill([
+                'status' => 'queued',
+                'last_error_message' => null,
+                'next_retry_at' => now(),
+            ])->save();
+            $this->distributionOrchestrator->log(
+                'info',
+                '分发任务已手动重新入队',
+                (int) $distribution->distribution_channel_id,
+                (int) $distribution->id,
+                (int) $distribution->article_id,
+                ['event' => 'distribution.retry_queued']
+            );
+            ProcessArticleDistributionJob::dispatch((int) $distribution->id)
+                ->onQueue('distribution')
+                ->afterCommit();
+
+            return 'queued';
+        });
+
+        if (in_array($result, ['missing', 'article_unavailable'], true)) {
+            return back()->withErrors(__('admin.distribution.message.job_not_found'));
+        }
+        if ($result === 'deleting') {
+            return redirect()
+                ->route('admin.distribution.delete', ['channelId' => (int) $candidate->distribution_channel_id])
+                ->withErrors(__('admin.distribution.delete.operation_blocked'));
+        }
+        if ($result === 'sending') {
+            return back()->withErrors(__('admin.distribution.delete.sending_retry_blocked'));
+        }
+        if ($result === 'outcome_unknown') {
+            return back()->withErrors(__('admin.distribution.message.outcome_unknown_retry_blocked'));
+        }
+        if ($result !== 'queued') {
+            return back()->withErrors(__('admin.distribution.delete.channel_unavailable_error'));
+        }
+
+        return back()->with('message', __('admin.distribution.message.retry_queued'));
+    }
+
+    public function editArticle(int $distributionId): View|RedirectResponse
+    {
+        $distribution = ArticleDistribution::query()
+            ->with(['article', 'channel'])
+            ->whereKey($distributionId)
+            ->first();
+
+        if (! $distribution || ! $distribution->article || ! $distribution->channel) {
+            return back()->withErrors(__('admin.distribution.message.job_not_found'));
+        }
+        if ($redirect = $this->hostedSiteRedirect($distribution->channel)) {
+            return $redirect;
+        }
+        if ($redirect = $this->deletingChannelRedirect($distribution->channel)) {
+            return $redirect;
+        }
+
+        return view('admin.distribution.article-edit', [
+            'pageTitle' => __('admin.distribution.remote_article.edit_title'),
+            'activeMenu' => 'distribution',
+            'adminSiteName' => AdminWeb::siteName(),
+            'distribution' => $distribution,
+            'article' => $distribution->article,
+            'channel' => $distribution->channel,
+        ]);
+    }
+
+    public function updateArticle(Request $request, int $distributionId): RedirectResponse
+    {
+        $distribution = ArticleDistribution::query()
+            ->with(['article', 'channel'])
+            ->whereKey($distributionId)
+            ->first();
+
+        if (! $distribution || ! $distribution->article || ! $distribution->channel) {
+            return back()->withErrors(__('admin.distribution.message.job_not_found'));
+        }
+        if ($redirect = $this->hostedSiteRedirect($distribution->channel)) {
+            return $redirect;
+        }
+        if ($redirect = $this->deletingChannelRedirect($distribution->channel)) {
+            return $redirect;
+        }
+
+        $payload = $request->validate([
+            'title' => ['required', 'string', 'max:500'],
+            'excerpt' => ['nullable', 'string'],
+            'content' => ['required', 'string'],
+            'keywords' => ['nullable', 'string'],
+            'meta_description' => ['nullable', 'string'],
+        ]);
+
+        try {
+            DB::transaction(function () use ($distribution, $payload): void {
+                $article = Article::query()
+                    ->whereKey((int) $distribution->article_id)
+                    ->lockForUpdate()
+                    ->firstOrFail();
+                $payload = $article->is_ai_generated
+                    ? $this->articleCitationMarkerCleaner->cleanArticleFields($payload)
+                    : $payload;
+                if (trim((string) $payload['content']) === '') {
+                    throw ValidationException::withMessages(['content' => __('validation.required')]);
+                }
+                $article->forceFill([
+                    'title' => (string) $payload['title'],
+                    'excerpt' => filled($payload['excerpt'] ?? null) ? (string) $payload['excerpt'] : null,
+                    'content' => (string) $payload['content'],
+                    'keywords' => filled($payload['keywords'] ?? null) ? (string) $payload['keywords'] : null,
+                    'meta_description' => filled($payload['meta_description'] ?? null) ? (string) $payload['meta_description'] : null,
+                ])->save();
+                $this->hostedFingerprints->synchronizeLockedArticle($article);
+            }, 3);
+            $distribution->refresh();
+            $this->distributionOrchestrator->updateRemoteArticle($distribution);
+        } catch (Throwable $e) {
+            return back()
+                ->withInput()
+                ->withErrors(__('admin.distribution.message.remote_article_update_failed', ['message' => $e->getMessage()]));
+        }
+
+        return redirect()
+            ->route('admin.distribution.show', ['channelId' => (int) $distribution->distribution_channel_id])
+            ->with('message', __('admin.distribution.message.remote_article_updated'));
+    }
+
+    public function deleteArticle(Request $request, int $distributionId): JsonResponse|RedirectResponse
+    {
+        $distribution = ArticleDistribution::query()
+            ->with(['article', 'channel'])
+            ->whereKey($distributionId)
+            ->first();
+
+        if (! $distribution || ! $distribution->article || ! $distribution->channel) {
+            if ($request->expectsJson()) {
+                return response()->json([
+                    'ok' => false,
+                    'message' => __('admin.distribution.message.job_not_found'),
+                ], 404);
+            }
+
+            return back()->withErrors(__('admin.distribution.message.job_not_found'));
+        }
+        if ($redirect = $this->hostedSiteRedirect($distribution->channel)) {
+            return $redirect;
+        }
+        if ((string) $distribution->channel->status === DistributionChannel::STATUS_DELETING) {
+            $message = __('admin.distribution.delete.operation_blocked');
+            if ($request->expectsJson()) {
+                return response()->json(['ok' => false, 'message' => $message], 409);
+            }
+
+            return redirect()
+                ->route('admin.distribution.delete', ['channelId' => (int) $distribution->channel->id])
+                ->withErrors($message);
+        }
+
+        try {
+            $distribution = $this->distributionOrchestrator->deleteRemoteArticle($distribution);
+        } catch (Throwable $e) {
+            if ($request->expectsJson()) {
+                return response()->json([
+                    'ok' => false,
+                    'message' => __('admin.distribution.message.remote_article_delete_failed', ['message' => $e->getMessage()]),
+                ], 500);
+            }
+
+            return back()->withErrors(__('admin.distribution.message.remote_article_delete_failed', ['message' => $e->getMessage()]));
+        }
+
+        if ($request->expectsJson()) {
+            return response()->json([
+                'ok' => true,
+                'message' => __('admin.distribution.message.remote_article_deleted'),
+                'job' => [
+                    'id' => (int) $distribution->id,
+                    'action' => (string) $distribution->action,
+                    'status' => (string) $distribution->status,
+                    'remote_url' => $distribution->remote_url,
+                ],
+            ]);
+        }
+
+        return redirect()
+            ->route('admin.distribution.show', ['channelId' => (int) $distribution->distribution_channel_id])
+            ->with('message', __('admin.distribution.message.remote_article_deleted'));
+    }
+
+    public function health(int $channelId): RedirectResponse
+    {
+        $channel = DistributionChannel::query()->whereKey($channelId)->first();
+        if (! $channel) {
+            return redirect()->route('admin.distribution.index')->withErrors(__('admin.distribution.message.not_found'));
+        }
+        if ($redirect = $this->hostedSiteRedirect($channel)) {
+            return $redirect;
+        }
+        if ($redirect = $this->deletingChannelRedirect($channel)) {
+            return $redirect;
+        }
+
+        try {
+            $result = $this->distributionOrchestrator->healthCheck($channel);
+            $resolvedEndpointUrl = is_string($result['agent_base_url'] ?? null)
+                ? rtrim((string) $result['agent_base_url'], '/')
+                : null;
+            $channel->forceFill([
+                'endpoint_url' => $resolvedEndpointUrl ?: $channel->endpoint_url,
+                'last_health_status' => 'ok',
+                'last_health_checked_at' => now(),
+                'last_error_message' => null,
+            ])->save();
+
+            return back()->with('message', __('admin.distribution.message.health_ok').' '.json_encode($result, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+        } catch (Throwable $e) {
+            $channel->forceFill([
+                'last_health_status' => 'failed',
+                'last_health_checked_at' => now(),
+                'last_error_message' => $e->getMessage(),
+            ])->save();
+
+            return back()->withErrors(__('admin.distribution.message.health_failed', ['message' => $e->getMessage()]));
+        }
+    }
+
+    public function refreshFrontendCapabilities(int $channelId): RedirectResponse
+    {
+        $channel = DistributionChannel::query()
+            ->with('activeSecret')
+            ->whereKey($channelId)
+            ->first();
+        if (! $channel) {
+            return redirect()->route('admin.distribution.index')->withErrors(__('admin.distribution.message.not_found'));
+        }
+        if ($redirect = $this->hostedSiteRedirect($channel)) {
+            return $redirect;
+        }
+        if ($redirect = $this->deletingChannelRedirect($channel)) {
+            return $redirect;
+        }
+
+        try {
+            $result = $this->channelOperationLeaseService->run(
+                $channel,
+                'frontend_capabilities_refresh',
+                fn (DistributionChannel $lockedChannel): array => $this->frontendExperienceInspector
+                    ->refreshRemoteCapabilities($lockedChannel),
+            );
+        } catch (DistributionChannelDeletionBlocked) {
+            return redirect()
+                ->route('admin.distribution.delete', ['channelId' => (int) $channel->id])
+                ->withErrors(__('admin.distribution.delete.operation_blocked'));
+        }
+        $message = '远端前台能力已刷新：'.(string) ($result['message'] ?? '');
+
+        return (string) ($result['status'] ?? '') === 'ok'
+            ? back()->with('message', $message)
+            : back()->with('message', $message)->withErrors((string) ($result['message'] ?? '远端前台能力刷新失败。'));
+    }
+
+    public function previewSyncSettings(int $channelId): View|RedirectResponse
+    {
+        $channel = DistributionChannel::query()
+            ->with('activeSecret')
+            ->whereKey($channelId)
+            ->first();
+        if (! $channel) {
+            return redirect()->route('admin.distribution.index')->withErrors(__('admin.distribution.message.not_found'));
+        }
+        if ($redirect = $this->hostedSiteRedirect($channel)) {
+            return $redirect;
+        }
+        if ($redirect = $this->deletingChannelRedirect($channel)) {
+            return $redirect;
+        }
+
+        return $this->syncPreviewView('single', collect([$channel]));
+    }
+
+    public function previewSyncSettingsAll(): View
+    {
+        $channels = $this->syncableAgentChannelsQuery()
+            ->orderBy('id')
+            ->get();
+
+        return $this->syncPreviewView('all', $channels);
+    }
+
+    public function previewSyncSettingsSelected(Request $request): View|RedirectResponse
+    {
+        $channelIds = $this->validatedSyncChannelIds($request);
+        if ($channelIds->isEmpty()) {
+            return back()->withErrors(__('admin.distribution.message.settings_sync_selected_empty'));
+        }
+
+        $channels = $this->syncableAgentChannelsQuery()
+            ->whereIn('id', $channelIds->all())
+            ->orderBy('id')
+            ->get();
+
+        if ($channels->isEmpty()) {
+            return back()->withErrors(__('admin.distribution.message.settings_sync_selected_empty'));
+        }
+
+        return $this->syncPreviewView('selected', $channels);
+    }
+
+    public function syncSettings(Request $request, int $channelId): RedirectResponse
+    {
+        $channel = DistributionChannel::query()
+            ->with('activeSecret')
+            ->whereKey($channelId)
+            ->first();
+        if (! $channel) {
+            return redirect()->route('admin.distribution.index')->withErrors(__('admin.distribution.message.not_found'));
+        }
+        if ($redirect = $this->hostedSiteRedirect($channel)) {
+            return $redirect;
+        }
+        if ($redirect = $this->deletingChannelRedirect($channel)) {
+            return $redirect;
+        }
+
+        if (! $request->boolean('frontend_sync_confirmed') && $this->frontendExperienceInspector->requiresSyncConfirmation($channel)) {
+            return redirect()
+                ->route('admin.distribution.sync-settings.preview', ['channelId' => (int) $channel->id])
+                ->withErrors('同步前需要先确认前台体验风险。');
+        }
+
+        try {
+            $this->syncChannelSiteSettings($channel);
+            $refreshCount = $this->distributionOrchestrator->enqueueChannelContentRefresh($channel);
+
+            return redirect()
+                ->route('admin.distribution.show', ['channelId' => (int) $channel->id])
+                ->with('message', $refreshCount > 0
+                    ? __('admin.distribution.message.settings_synced_with_content_refresh', ['count' => $refreshCount])
+                    : __('admin.distribution.message.settings_synced'));
+        } catch (Throwable $e) {
+            return back()->withErrors(__('admin.distribution.message.settings_sync_failed', ['message' => $e->getMessage()]));
+        }
+    }
+
+    public function syncSettingsAll(Request $request): RedirectResponse
+    {
+        $channels = $this->syncableAgentChannelsQuery()
+            ->orderBy('id')
+            ->get();
+
+        if (! $request->boolean('frontend_sync_confirmed')
+            && (bool) $this->frontendExperienceInspector->syncPreviewForChannels($channels)['requires_confirmation']) {
+            return redirect()
+                ->route('admin.distribution.sync-settings-all.preview')
+                ->withErrors('同步前需要先确认前台体验风险。');
+        }
+
+        $synced = 0;
+        $failed = 0;
+        $refreshCount = 0;
+        foreach ($channels as $channel) {
+            try {
+                $this->syncChannelSiteSettings($channel);
+                $refreshCount += $this->distributionOrchestrator->enqueueChannelContentRefresh($channel);
+                $synced++;
+            } catch (Throwable) {
+                $failed++;
+            }
+        }
+
+        $message = __('admin.distribution.message.settings_synced_all', [
+            'success' => $synced,
+            'failed' => $failed,
+            'refresh' => $refreshCount,
+        ]);
+
+        return $failed > 0
+            ? back()->with('message', $message)->withErrors(__('admin.distribution.message.settings_synced_all_failed_hint'))
+            : back()->with('message', $message);
+    }
+
+    public function syncSettingsSelected(Request $request): RedirectResponse
+    {
+        $channelIds = $this->validatedSyncChannelIds($request);
+
+        if ($channelIds->isEmpty()) {
+            return back()->withErrors(__('admin.distribution.message.settings_sync_selected_empty'));
+        }
+
+        $channels = $this->syncableAgentChannelsQuery()
+            ->whereIn('id', $channelIds->all())
+            ->orderBy('id')
+            ->get();
+
+        if ($channels->isEmpty()) {
+            return back()->withErrors(__('admin.distribution.message.settings_sync_selected_empty'));
+        }
+
+        if (! $request->boolean('frontend_sync_confirmed')
+            && (bool) $this->frontendExperienceInspector->syncPreviewForChannels($channels)['requires_confirmation']) {
+            return back()->withErrors('同步前需要先通过预览页确认前台体验风险。');
+        }
+
+        $synced = 0;
+        $failed = 0;
+        $refreshCount = 0;
+        foreach ($channels as $channel) {
+            try {
+                $this->syncChannelSiteSettings($channel);
+                $refreshCount += $this->distributionOrchestrator->enqueueChannelContentRefresh($channel);
+                $synced++;
+            } catch (Throwable) {
+                $failed++;
+            }
+        }
+
+        $message = __('admin.distribution.message.settings_synced_selected', [
+            'success' => $synced,
+            'failed' => $failed,
+            'refresh' => $refreshCount,
+        ]);
+
+        return $failed > 0
+            ? back()->with('message', $message)->withErrors(__('admin.distribution.message.settings_synced_all_failed_hint'))
+            : back()->with('message', $message);
+    }
+
+    /**
+     * @param  iterable<DistributionChannel>  $channels
+     */
+    private function syncPreviewView(string $scope, iterable $channels): View
+    {
+        $channels = collect($channels)->values();
+        $previewReport = $this->frontendExperienceInspector->syncPreviewForChannels($channels);
+
+        return view('admin.distribution.sync-preview', [
+            'pageTitle' => '前台体验同步预览',
+            'activeMenu' => 'distribution',
+            'adminSiteName' => AdminWeb::siteName(),
+            'scope' => $scope,
+            'channels' => $channels,
+            'previewReport' => $previewReport,
+        ]);
+    }
+
+    private function validatedSyncChannelIds(Request $request)
+    {
+        return collect($request->input('channel_ids', []))
+            ->map(static fn ($id): int => (int) $id)
+            ->filter(static fn (int $id): bool => $id > 0)
+            ->unique()
+            ->values();
+    }
+
+    private function syncableAgentChannelsQuery()
+    {
+        return DistributionChannel::query()
+            ->with('activeSecret')
+            ->where('status', 'active')
+            ->where(function ($query): void {
+                $query->whereNull('channel_type')
+                    ->orWhere('channel_type', 'geoflow_agent');
+            });
+    }
+
+    /**
+     * @return array<string,mixed>
+     */
+    private function syncChannelSiteSettings(DistributionChannel $channel): array
+    {
+        return $this->channelOperationLeaseService->run(
+            $channel,
+            'site_settings_sync',
+            function (DistributionChannel $lockedChannel): array {
+                try {
+                    $result = $this->publisherManager->forChannel($lockedChannel)->syncSiteSettings($lockedChannel);
+                    if (isset($result['article_permalink_revision'])) {
+                        $capabilities = $lockedChannel->frontendCapabilitiesCache();
+                        $capabilities['current_article_permalink_revision'] = (int) $result['article_permalink_revision'];
+                        $capabilities['current_article_permalink_pattern'] = (string) ($result['article_permalink_pattern'] ?? '');
+                        $lockedChannel->fillFrontendCapabilitiesCache($capabilities)->save();
+                    }
+                    $this->distributionOrchestrator->log(
+                        'info',
+                        '目标站点设置已同步',
+                        (int) $lockedChannel->id,
+                        null,
+                        null,
+                        [
+                            'event' => 'site.settings.synced',
+                            'remote_result' => $result,
+                            'sync_summary' => $this->frontendExperienceInspector->syncSummary($lockedChannel),
+                        ]
+                    );
+
+                    return $result;
+                } catch (Throwable $e) {
+                    $this->distributionOrchestrator->log(
+                        'error',
+                        '目标站点设置同步失败：'.$e->getMessage(),
+                        (int) $lockedChannel->id,
+                        null,
+                        null,
+                        ['event' => 'site.settings.sync_failed']
+                    );
+
+                    throw $e;
+                }
+            },
+        );
+    }
+
+    private function normalizeDomain(string $domain): string
+    {
+        $value = trim($domain);
+        if ($value === '') {
+            return '';
+        }
+
+        if (! str_contains($value, '://')) {
+            $value = 'https://'.$value;
+        }
+
+        $host = parse_url($value, PHP_URL_HOST);
+
+        return is_string($host) && $host !== '' ? $host : trim($domain);
+    }
+
+    private function normalizeEndpointUrl(string $endpointUrl): string
+    {
+        $value = trim($endpointUrl);
+        if ($value === '') {
+            return '';
+        }
+
+        if (! str_contains($value, '://')) {
+            $value = 'https://'.$value;
+        }
+
+        return rtrim($value, '/');
+    }
+
+    private function isValidHttpEndpoint(string $endpointUrl): bool
+    {
+        if ($endpointUrl === '' || preg_match('/\s/', $endpointUrl) === 1) {
+            return false;
+        }
+
+        $parts = parse_url($endpointUrl);
+        if (! is_array($parts)) {
+            return false;
+        }
+
+        $scheme = strtolower((string) ($parts['scheme'] ?? ''));
+        $host = (string) ($parts['host'] ?? '');
+
+        return in_array($scheme, ['http', 'https'], true) && $host !== '';
+    }
+
+    /**
+     * @return array<string,mixed>
+     */
+    private function validateChannel(Request $request): array
+    {
+        $payload = $request->validate([
+            'name' => ['required', 'string', 'max:120'],
+            'domain' => ['required', 'string', 'max:255'],
+            'endpoint_url' => ['required', 'string', 'max:500'],
+            'channel_type' => ['nullable', 'string', 'in:geoflow_agent,wordpress_rest,generic_http_api,cn_platform'],
+            'front_mode' => ['nullable', 'string', 'in:static,rewrite'],
+            'template_key' => ['nullable', 'string', 'max:120'],
+            'status' => ['required', 'string', 'in:active,paused'],
+            'description' => ['nullable', 'string', 'max:1000'],
+            'wordpress_username' => ['nullable', 'string', 'max:120'],
+            'wordpress_application_password' => ['nullable', 'string', 'max:255'],
+            'wordpress_post_status' => ['nullable', 'string', 'in:publish,draft,pending,private'],
+            'wordpress_category_strategy' => ['nullable', 'string', 'in:match_or_create,match_only,fixed'],
+            'wordpress_fixed_category' => ['nullable', 'string', 'max:120'],
+            'wordpress_tag_strategy' => ['nullable', 'string', 'in:keywords_to_tags,disabled'],
+            'wordpress_image_strategy' => ['nullable', 'string', 'in:upload_to_media,keep_original'],
+            'generic_auth_type' => ['nullable', 'string', 'in:none,bearer,basic,header_key,hmac'],
+            'generic_basic_username' => ['nullable', 'string', 'max:120'],
+            'generic_secret' => ['nullable', 'string', 'max:1000'],
+            'generic_header_name' => ['nullable', 'string', 'max:120'],
+            'generic_hmac_key_id_header' => ['nullable', 'string', 'max:120'],
+            'generic_hmac_signature_header' => ['nullable', 'string', 'max:120'],
+            'generic_hmac_timestamp_header' => ['nullable', 'string', 'max:120'],
+            'generic_hmac_nonce_header' => ['nullable', 'string', 'max:120'],
+            'generic_hmac_body_hash_header' => ['nullable', 'string', 'max:120'],
+            'generic_timeout_seconds' => ['nullable', 'integer', 'min:5', 'max:120'],
+            'generic_success_statuses' => ['nullable', 'string', 'max:120'],
+            'generic_health_method' => ['nullable', 'string', 'in:GET,POST,PUT,PATCH,DELETE'],
+            'generic_health_path' => ['nullable', 'string', 'max:255'],
+            'generic_publish_method' => ['nullable', 'string', 'in:GET,POST,PUT,PATCH,DELETE'],
+            'generic_publish_path' => ['nullable', 'string', 'max:255'],
+            'generic_update_method' => ['nullable', 'string', 'in:GET,POST,PUT,PATCH,DELETE'],
+            'generic_update_path' => ['nullable', 'string', 'max:255'],
+            'generic_delete_method' => ['nullable', 'string', 'in:GET,POST,PUT,PATCH,DELETE'],
+            'generic_delete_path' => ['nullable', 'string', 'max:255'],
+            'generic_settings_method' => ['nullable', 'string', 'in:GET,POST,PUT,PATCH,DELETE'],
+            'generic_settings_path' => ['nullable', 'string', 'max:255'],
+            'generic_remote_id_path' => ['nullable', 'string', 'max:120'],
+            'generic_remote_url_path' => ['nullable', 'string', 'max:120'],
+            'generic_payload_wrapper' => ['nullable', 'string', 'in:none,data'],
+            'cn_platform' => ['nullable', 'string', 'max:60'],
+            'cn_auth_mode' => ['nullable', 'string', 'in:oauth2,api,browser_assist'],
+            'cn_post_status' => ['nullable', 'string', 'in:draft,publish'],
+            'cn_append_source_link' => ['nullable', 'boolean'],
+            'cn_title_limit' => ['nullable', 'integer', 'min:10', 'max:200'],
+            'cn_summary_limit' => ['nullable', 'integer', 'min:20', 'max:1000'],
+            'cn_api_base' => ['nullable', 'string', 'max:500'],
+            'cn_api_publish_url' => ['nullable', 'string', 'max:500'],
+            'cn_api_update_url' => ['nullable', 'string', 'max:500'],
+            'cn_api_method' => ['nullable', 'string', 'in:POST,PUT,PATCH'],
+            'cn_api_auth_style' => ['nullable', 'string', 'in:header_bearer,header_key,query_token'],
+            'cn_api_auth_header' => ['nullable', 'string', 'max:120'],
+            'cn_api_title_field' => ['nullable', 'string', 'max:120'],
+            'cn_api_content_field' => ['nullable', 'string', 'max:120'],
+            'cn_api_url_field' => ['nullable', 'string', 'max:120'],
+            'cn_api_remote_id_path' => ['nullable', 'string', 'max:120'],
+            'cn_api_remote_url_path' => ['nullable', 'string', 'max:120'],
+            'cn_content_format' => ['nullable', 'string', 'in:html,markdown,text'],
+            'cn_image_strategy' => ['nullable', 'string', 'in:keep_original,omit'],
+            'cn_write_url' => ['nullable', 'string', 'max:500'],
+            'cn_mp_persona_id' => ['nullable', 'integer', 'min:1'],
+            'cn_secret_token' => ['nullable', 'string', 'max:4000'],
+            'cn_secret_token_api' => ['nullable', 'string', 'max:4000'],
+            'cn_secret_uid' => ['nullable', 'string', 'max:120'],
+            'cn_secret_app_key' => ['nullable', 'string', 'max:255'],
+            'cn_secret_app_secret' => ['nullable', 'string', 'max:255'],
+            'cn_secret_redirect_uri' => ['nullable', 'string', 'max:500'],
+            'site_name' => ['nullable', 'string', 'max:120'],
+            'site_subtitle' => ['nullable', 'string', 'max:255'],
+            'site_description' => ['nullable', 'string'],
+            'site_keywords' => ['nullable', 'string', 'max:500'],
+            'copyright_info' => ['nullable', 'string', 'max:500'],
+            'site_logo' => ['nullable', 'url', 'max:500'],
+            'site_favicon' => ['nullable', 'url', 'max:500'],
+            'seo_title_template' => ['nullable', 'string', 'max:255'],
+            'seo_description_template' => ['nullable', 'string', 'max:255'],
+            'featured_limit' => ['nullable', 'integer', 'min:1', 'max:100'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:200'],
+            'frontend_experience_mode' => ['nullable', 'string', 'in:custom,inherit_default,snapshot_default'],
+            'homepage_style_json' => ['nullable', 'string', 'max:50000'],
+            'homepage_modules_json' => ['nullable', 'string', 'max:120000'],
+            'home_carousel_slides_json' => ['nullable', 'string', 'max:30000'],
+            'article_text_ad_policy' => ['nullable', 'array'],
+            'article_text_ad_policy.content_top.mode' => ['nullable', 'string', 'in:inherit,disabled,selected,custom'],
+            'article_text_ad_policy.content_top.module_ids' => ['nullable', 'array'],
+            'article_text_ad_policy.content_top.module_ids.*' => ['nullable', 'string', 'max:120'],
+            'article_text_ad_policy.content_top.ad_ids' => ['nullable', 'array'],
+            'article_text_ad_policy.content_top.ad_ids.*' => ['nullable', 'string', 'max:120'],
+            'article_text_ad_policy.content_top.custom_modules' => ['nullable', 'array'],
+            'article_text_ad_policy.content_bottom.mode' => ['nullable', 'string', 'in:inherit,disabled,selected,custom'],
+            'article_text_ad_policy.content_bottom.module_ids' => ['nullable', 'array'],
+            'article_text_ad_policy.content_bottom.module_ids.*' => ['nullable', 'string', 'max:120'],
+            'article_text_ad_policy.content_bottom.ad_ids' => ['nullable', 'array'],
+            'article_text_ad_policy.content_bottom.ad_ids.*' => ['nullable', 'string', 'max:120'],
+            'article_text_ad_policy.content_bottom.custom_modules' => ['nullable', 'array'],
+        ]);
+
+        $payload['endpoint_url'] = $this->normalizeEndpointUrl((string) $payload['endpoint_url']);
+        $payload['channel_type'] = (string) ($payload['channel_type'] ?? 'geoflow_agent');
+        $payload['front_mode'] = (string) ($payload['front_mode'] ?? 'static');
+        $payload['frontend_experience_mode'] = DistributionChannel::normalizeFrontendExperienceMode($payload['frontend_experience_mode'] ?? null);
+        $payload['homepage_style_payload'] = $this->decodeOptionalFrontendJson($payload['homepage_style_json'] ?? null, 'homepage_style_json');
+        $payload['homepage_modules_payload'] = $this->decodeOptionalFrontendJson($payload['homepage_modules_json'] ?? null, 'homepage_modules_json');
+        $payload['home_carousel_slides_payload'] = $this->decodeOptionalFrontendJson($payload['home_carousel_slides_json'] ?? null, 'home_carousel_slides_json');
+        if (! $this->isValidHttpEndpoint((string) $payload['endpoint_url'])) {
+            throw ValidationException::withMessages([
+                'endpoint_url' => __('admin.distribution.validation.endpoint_url'),
+            ]);
+        }
+        if ($payload['channel_type'] === 'wordpress_rest') {
+            if (! filled($payload['wordpress_username'] ?? null)) {
+                throw ValidationException::withMessages([
+                    'wordpress_username' => __('admin.distribution.validation.wordpress_username'),
+                ]);
+            }
+            if ($request->isMethod('post') && ! filled($payload['wordpress_application_password'] ?? null)) {
+                throw ValidationException::withMessages([
+                    'wordpress_application_password' => __('admin.distribution.validation.wordpress_application_password'),
+                ]);
+            }
+        }
+        if ($payload['channel_type'] === 'generic_http_api') {
+            $authType = (string) ($payload['generic_auth_type'] ?? 'bearer');
+            if ($authType === 'basic' && ! filled($payload['generic_basic_username'] ?? null)) {
+                throw ValidationException::withMessages([
+                    'generic_basic_username' => __('admin.distribution.validation.generic_basic_username'),
+                ]);
+            }
+            if ($request->isMethod('post') && $authType !== 'none' && ! filled($payload['generic_secret'] ?? null)) {
+                throw ValidationException::withMessages([
+                    'generic_secret' => __('admin.distribution.validation.generic_secret'),
+                ]);
+            }
+            $successStatuses = $this->normalizeGenericSuccessStatuses($payload['generic_success_statuses'] ?? '200,201,202,204');
+            if ($successStatuses === []) {
+                throw ValidationException::withMessages([
+                    'generic_success_statuses' => __('admin.distribution.validation.generic_success_statuses'),
+                ]);
+            }
+            $payload['generic_success_statuses'] = implode(',', $successStatuses);
+            foreach ($this->genericMethodRules() as $field => $rule) {
+                [$allowedMethods, $defaultMethod] = $rule;
+                $method = strtoupper(trim((string) ($payload[$field] ?? $defaultMethod)));
+                if (! in_array($method, $allowedMethods, true)) {
+                    throw ValidationException::withMessages([
+                        $field => __('admin.distribution.validation.generic_method', ['methods' => implode(', ', $allowedMethods)]),
+                    ]);
+                }
+                $payload[$field] = $method;
+            }
+            foreach ($this->genericHeaderNameFields() as $field) {
+                $headerName = trim((string) ($payload[$field] ?? ''));
+                if ($headerName !== '' && ! $this->isValidHttpHeaderName($headerName)) {
+                    throw ValidationException::withMessages([
+                        $field => __('admin.distribution.validation.generic_header_name'),
+                    ]);
+                }
+            }
+            foreach ($this->genericPathFields() as $field => $required) {
+                $path = trim((string) ($payload[$field] ?? ''));
+                if ($required && $path === '') {
+                    throw ValidationException::withMessages([
+                        $field => __('admin.distribution.validation.generic_path_required'),
+                    ]);
+                }
+                if ($path !== '' && (! $this->isValidGenericPath($path))) {
+                    throw ValidationException::withMessages([
+                        $field => __('admin.distribution.validation.generic_path'),
+                    ]);
+                }
+                $payload[$field] = $path;
+            }
+        }
+        if ($payload['channel_type'] === DistributionChannel::TYPE_CN_PLATFORM) {
+            $this->validateCnPlatformPayload($payload, $request);
+        }
+
+        $this->validateArticleTextAdPolicyPayload($payload['article_text_ad_policy'] ?? null);
+
+        return $payload;
+    }
+
+    /**
+     * @param  array<string,mixed>  $payload
+     */
+    private function validateCnPlatformPayload(array &$payload, Request $request): void
+    {
+        $platform = trim((string) ($payload['cn_platform'] ?? ''));
+        if (! CnPlatformRegistry::exists($platform)) {
+            throw ValidationException::withMessages([
+                'cn_platform' => __('admin.distribution.validation.cn_platform'),
+            ]);
+        }
+
+        $preset = CnPlatformRegistry::get($platform) ?? [];
+        $mode = trim((string) ($payload['cn_auth_mode'] ?? ''));
+        if ($mode === '') {
+            $mode = (string) ($preset['modes'][0] ?? CnPlatformRegistry::AUTH_BROWSER_ASSIST);
+        }
+        if (! CnPlatformRegistry::supportsMode($platform, $mode)) {
+            throw ValidationException::withMessages([
+                'cn_auth_mode' => __('admin.distribution.validation.cn_auth_mode'),
+            ]);
+        }
+        $payload['cn_platform'] = $platform;
+        $payload['cn_auth_mode'] = $mode;
+
+        if ($mode === CnPlatformRegistry::AUTH_API) {
+            $publishUrl = trim((string) ($payload['cn_api_publish_url'] ?? ''));
+            if ($publishUrl === '' || ! filter_var($publishUrl, FILTER_VALIDATE_URL)
+                || ! preg_match('#^https?://#i', $publishUrl)) {
+                throw ValidationException::withMessages([
+                    'cn_api_publish_url' => __('admin.distribution.validation.cn_api_publish_url'),
+                ]);
+            }
+            $updateUrl = trim((string) ($payload['cn_api_update_url'] ?? ''));
+            if ($updateUrl !== '' && (! filter_var($updateUrl, FILTER_VALIDATE_URL) || ! preg_match('#^https?://#i', $updateUrl))) {
+                throw ValidationException::withMessages([
+                    'cn_api_update_url' => __('admin.distribution.validation.cn_api_publish_url'),
+                ]);
+            }
+            $authHeader = trim((string) ($payload['cn_api_auth_header'] ?? ''));
+            if ($authHeader !== '' && ! $this->isValidHttpHeaderName($authHeader)) {
+                throw ValidationException::withMessages([
+                    'cn_api_auth_header' => __('admin.distribution.validation.generic_header_name'),
+                ]);
+            }
+            if ($request->isMethod('post') && ! filled($payload['cn_secret_token'] ?? null) && ! filled($payload['cn_secret_token_api'] ?? null)) {
+                throw ValidationException::withMessages([
+                    'cn_secret_token_api' => __('admin.distribution.validation.cn_secret_token'),
+                ]);
+            }
+        }
+
+        if ($mode === CnPlatformRegistry::AUTH_OAUTH2 && $request->isMethod('post')) {
+            $hasToken = filled($payload['cn_secret_token'] ?? null) && filled($payload['cn_secret_uid'] ?? null);
+            $hasApp = filled($payload['cn_secret_app_key'] ?? null) && filled($payload['cn_secret_app_secret'] ?? null);
+            if (! $hasToken && ! $hasApp) {
+                throw ValidationException::withMessages([
+                    'cn_secret_token' => __('admin.distribution.validation.cn_secret_oauth'),
+                ]);
+            }
+        }
+    }
+
+    /**
+     * @return array<string,mixed>|list<mixed>|null
+     */
+    private function decodeOptionalFrontendJson(mixed $value, string $field): ?array
+    {
+        $raw = trim((string) ($value ?? ''));
+        if ($raw === '') {
+            return null;
+        }
+
+        $decoded = json_decode($raw, true);
+        if (json_last_error() !== JSON_ERROR_NONE || ! is_array($decoded)) {
+            throw ValidationException::withMessages([
+                $field => '前台体验 JSON 格式无效。',
+            ]);
+        }
+
+        return $decoded;
+    }
+
+    private function validateArticleTextAdPolicyPayload(mixed $policy): void
+    {
+        if (! is_array($policy)) {
+            return;
+        }
+
+        $placementPolicies = array_key_exists('mode', $policy)
+            ? [
+                ArticleTextAdPicker::PLACEMENT_TOP => $policy,
+                ArticleTextAdPicker::PLACEMENT_BOTTOM => $policy,
+            ]
+            : [
+                ArticleTextAdPicker::PLACEMENT_TOP => is_array($policy[ArticleTextAdPicker::PLACEMENT_TOP] ?? null) ? $policy[ArticleTextAdPicker::PLACEMENT_TOP] : [],
+                ArticleTextAdPicker::PLACEMENT_BOTTOM => is_array($policy[ArticleTextAdPicker::PLACEMENT_BOTTOM] ?? null) ? $policy[ArticleTextAdPicker::PLACEMENT_BOTTOM] : [],
+            ];
+
+        foreach ($placementPolicies as $placement => $placementPolicy) {
+            if ((string) ($placementPolicy['mode'] ?? 'inherit') !== 'custom') {
+                continue;
+            }
+
+            $this->validateArticleTextAdCustomModules(
+                $placementPolicy['custom_modules'] ?? [],
+                (string) $placement
+            );
+        }
+    }
+
+    private function validateArticleTextAdCustomModules(mixed $modules, string $placement): void
+    {
+        if (! is_array($modules)) {
+            return;
+        }
+
+        if (count($modules) > DistributionChannel::MAX_CUSTOM_TEXT_AD_MODULES_PER_PLACEMENT) {
+            throw ValidationException::withMessages([
+                'article_text_ad_policy' => __('admin.site_settings.ads.text_validation_max_modules', [
+                    'max' => DistributionChannel::MAX_CUSTOM_TEXT_AD_MODULES_PER_PLACEMENT,
+                ]),
+            ]);
+        }
+
+        foreach (array_values($modules) as $moduleIndex => $module) {
+            if (! is_array($module)) {
+                continue;
+            }
+
+            $moduleNumber = $moduleIndex + 1;
+            $modulePlacement = (string) ($module['placement'] ?? $placement);
+            if ($modulePlacement !== $placement || ! in_array($modulePlacement, ArticleTextAdPicker::PLACEMENTS, true)) {
+                throw ValidationException::withMessages([
+                    'article_text_ad_policy' => __('admin.site_settings.ads.text_validation_position', ['index' => $moduleNumber]),
+                ]);
+            }
+
+            $rawLinks = is_array($module['links'] ?? null) ? $module['links'] : [];
+            if (count($rawLinks) > ArticleTextAdPicker::MAX_LINKS_PER_MODULE) {
+                throw ValidationException::withMessages([
+                    'article_text_ad_policy' => __('admin.site_settings.ads.text_validation_max_links', [
+                        'index' => $moduleNumber,
+                        'max' => ArticleTextAdPicker::MAX_LINKS_PER_MODULE,
+                    ]),
+                ]);
+            }
+
+            $validLinks = 0;
+            foreach (array_values($rawLinks) as $linkIndex => $link) {
+                if (! is_array($link)) {
+                    continue;
+                }
+
+                $linkNumber = $moduleNumber.'.'.($linkIndex + 1);
+                $text = trim((string) ($link['text'] ?? ''));
+                $rawUrl = trim((string) ($link['url'] ?? ''));
+                $trackingParam = ltrim(trim((string) ($link['tracking_param'] ?? '')), "? \t\n\r\0\x0B");
+                $color = trim((string) ($link['text_color'] ?? ''));
+
+                if ($text === '' && $rawUrl === '' && $trackingParam === '') {
+                    continue;
+                }
+
+                $url = $this->normalizeArticleTextAdUrlForValidation($rawUrl);
+                if ($rawUrl !== '' && $url === '') {
+                    throw ValidationException::withMessages([
+                        'article_text_ad_policy' => __('admin.site_settings.ads.text_validation_url', ['index' => $linkNumber]),
+                    ]);
+                }
+
+                if ($text === '' || $url === '') {
+                    throw ValidationException::withMessages([
+                        'article_text_ad_policy' => __('admin.site_settings.ads.text_validation_required', ['index' => $linkNumber]),
+                    ]);
+                }
+
+                if ($color !== '' && ! $this->isValidArticleTextAdHexColor($color)) {
+                    throw ValidationException::withMessages([
+                        'article_text_ad_policy' => __('admin.site_settings.ads.text_validation_color', ['index' => $linkNumber]),
+                    ]);
+                }
+
+                if ($trackingParam !== '' && ! $this->isValidArticleTextAdTrackingParam($trackingParam)) {
+                    throw ValidationException::withMessages([
+                        'article_text_ad_policy' => __('admin.site_settings.ads.text_validation_tracking', ['index' => $linkNumber]),
+                    ]);
+                }
+
+                $validLinks++;
+            }
+
+            if (
+                $validLinks === 0
+                && (
+                    trim((string) ($module['id'] ?? '')) !== ''
+                    || trim((string) ($module['name'] ?? '')) !== ''
+                    || $this->hasArticleTextAdLinkData($rawLinks)
+                )
+            ) {
+                throw ValidationException::withMessages([
+                    'article_text_ad_policy' => __('admin.site_settings.ads.text_validation_module_required', ['index' => $moduleNumber]),
+                ]);
+            }
+        }
+    }
+
+    private function hasArticleTextAdLinkData(array $rawLinks): bool
+    {
+        foreach ($rawLinks as $link) {
+            if (! is_array($link)) {
+                continue;
+            }
+
+            if (
+                trim((string) ($link['text'] ?? '')) !== ''
+                || trim((string) ($link['url'] ?? '')) !== ''
+                || trim((string) ($link['tracking_param'] ?? '')) !== ''
+            ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function normalizeArticleTextAdUrlForValidation(string $url): string
+    {
+        $normalized = trim($url);
+        if ($normalized === '' || str_starts_with($normalized, '//')) {
+            return '';
+        }
+
+        if (str_starts_with($normalized, '/')) {
+            return $normalized;
+        }
+
+        if (preg_match('#^https?://#i', $normalized) === 1) {
+            return $normalized;
+        }
+
+        if (preg_match('#^[a-z][a-z0-9+.-]*:#i', $normalized) === 1) {
+            return '';
+        }
+
+        return '/'.ltrim($normalized, '/');
+    }
+
+    private function isValidArticleTextAdHexColor(string $color): bool
+    {
+        return preg_match('/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/', trim($color)) === 1;
+    }
+
+    private function isValidArticleTextAdTrackingParam(string $trackingParam): bool
+    {
+        $trackingParam = trim($trackingParam);
+
+        return $trackingParam !== ''
+            && mb_strlen($trackingParam) <= 250
+            && ! str_contains($trackingParam, '://')
+            && ! str_starts_with($trackingParam, '/')
+            && preg_match('/^[A-Za-z0-9._~%=&+;,:@-]+$/', $trackingParam) === 1;
+    }
+
+    /**
+     * @param  array<string,mixed>  $payload
+     * @return array<string,mixed>
+     */
+    private function normalizeChannelSiteSettings(array $payload, ?DistributionChannel $channel = null): array
+    {
+        $defaultName = trim((string) ($payload['name'] ?? 'GEOWorkFlow Target Site'));
+        $defaults = $channel?->resolvedSiteSettings() ?? [
+            'site_name' => $defaultName !== '' ? $defaultName : 'GEOWorkFlow Target Site',
+            'site_subtitle' => '',
+            'site_description' => '由 GEOWorkFlow 自动分发和管理的目标站点。',
+            'site_keywords' => '',
+            'copyright_info' => '© '.date('Y').' '.($defaultName !== '' ? $defaultName : 'GEOWorkFlow Target Site'),
+            'site_logo' => '',
+            'site_favicon' => '',
+            'seo_title_template' => '{title} - {site_name}',
+            'seo_description_template' => '{description}',
+            'featured_limit' => 6,
+            'per_page' => 12,
+        ];
+
+        return [
+            'site_name' => trim((string) ($payload['site_name'] ?? $defaults['site_name'])),
+            'site_subtitle' => trim((string) ($payload['site_subtitle'] ?? $defaults['site_subtitle'])),
+            'site_description' => trim((string) ($payload['site_description'] ?? $defaults['site_description'])),
+            'site_keywords' => trim((string) ($payload['site_keywords'] ?? $defaults['site_keywords'])),
+            'copyright_info' => trim((string) ($payload['copyright_info'] ?? $defaults['copyright_info'])),
+            'site_logo' => trim((string) ($payload['site_logo'] ?? $defaults['site_logo'])),
+            'site_favicon' => trim((string) ($payload['site_favicon'] ?? $defaults['site_favicon'])),
+            'seo_title_template' => trim((string) ($payload['seo_title_template'] ?? $defaults['seo_title_template'])),
+            'seo_description_template' => trim((string) ($payload['seo_description_template'] ?? $defaults['seo_description_template'])),
+            'featured_limit' => min(100, max(1, (int) ($payload['featured_limit'] ?? $defaults['featured_limit']))),
+            'per_page' => min(200, max(1, (int) ($payload['per_page'] ?? $defaults['per_page']))),
+        ] + $this->normalizeChannelFrontendSettings($payload, $channel);
+    }
+
+    /**
+     * @param  array<string,mixed>  $payload
+     * @return array{
+     *   homepage_style:array<string,string>,
+     *   homepage_modules:list<array<string,mixed>>,
+     *   home_carousel_slides:list<array<string,mixed>>
+     * }
+     */
+    private function normalizeChannelFrontendSettings(array $payload, ?DistributionChannel $channel = null): array
+    {
+        $mode = DistributionChannel::normalizeFrontendExperienceMode($payload['frontend_experience_mode'] ?? null);
+        $defaults = match ($mode) {
+            DistributionChannel::FRONTEND_EXPERIENCE_INHERIT_DEFAULT,
+            DistributionChannel::FRONTEND_EXPERIENCE_SNAPSHOT_DEFAULT => DistributionChannel::defaultFrontendExperienceSettings(),
+            default => $channel?->resolvedFrontendExperienceSettings() ?? DistributionChannel::defaultFrontendExperienceSettings(),
+        };
+
+        $stylePayload = $payload['homepage_style_payload'] ?? null;
+        $modulesPayload = $payload['homepage_modules_payload'] ?? null;
+        $slidesPayload = $payload['home_carousel_slides_payload'] ?? null;
+
+        if (is_array($modulesPayload) && ! array_is_list($modulesPayload)) {
+            $design = HomepageModuleBuilder::normalizeDesignPayload($modulesPayload);
+            $modulesPayload = $design['modules'];
+            if ($stylePayload === null) {
+                $stylePayload = $design['style'];
+            }
+        }
+
+        return [
+            'homepage_style' => DistributionChannel::normalizeHomepageStyle($stylePayload ?? $defaults['homepage_style']),
+            'homepage_modules' => DistributionChannel::normalizeHomepageModules($modulesPayload ?? $defaults['homepage_modules']),
+            'home_carousel_slides' => DistributionChannel::normalizeHomeCarouselSlides($slidesPayload ?? $defaults['home_carousel_slides']),
+        ];
+    }
+
+    /**
+     * @param  array<string,mixed>  $payload
+     * @return array<string,mixed>
+     */
+    private function normalizeChannelConfig(array $payload, ?DistributionChannel $channel = null): array
+    {
+        $channelType = (string) ($payload['channel_type'] ?? 'geoflow_agent');
+        $articleTextAdPolicy = $this->normalizeArticleTextAdPolicy($payload['article_text_ad_policy'] ?? null, $channel);
+        $frontendExperienceMode = DistributionChannel::normalizeFrontendExperienceMode(
+            $payload['frontend_experience_mode'] ?? $channel?->frontendExperienceMode()
+        );
+
+        if ($channelType === 'generic_http_api') {
+            $defaults = $channel?->resolvedGenericHttpConfig() ?? (new DistributionChannel)->resolvedGenericHttpConfig();
+
+            return $this->withExistingFrontendCapabilitiesCache([
+                'article_text_ad_policy' => $articleTextAdPolicy,
+                'frontend_experience_mode' => $frontendExperienceMode,
+                'generic_auth_type' => (string) ($payload['generic_auth_type'] ?? $defaults['generic_auth_type']),
+                'generic_basic_username' => trim((string) ($payload['generic_basic_username'] ?? $defaults['generic_basic_username'])),
+                'generic_header_name' => trim((string) ($payload['generic_header_name'] ?? $defaults['generic_header_name'])),
+                'generic_hmac_key_id_header' => trim((string) ($payload['generic_hmac_key_id_header'] ?? $defaults['generic_hmac_key_id_header'])),
+                'generic_hmac_signature_header' => trim((string) ($payload['generic_hmac_signature_header'] ?? $defaults['generic_hmac_signature_header'])),
+                'generic_hmac_timestamp_header' => trim((string) ($payload['generic_hmac_timestamp_header'] ?? $defaults['generic_hmac_timestamp_header'])),
+                'generic_hmac_nonce_header' => trim((string) ($payload['generic_hmac_nonce_header'] ?? $defaults['generic_hmac_nonce_header'])),
+                'generic_hmac_body_hash_header' => trim((string) ($payload['generic_hmac_body_hash_header'] ?? $defaults['generic_hmac_body_hash_header'])),
+                'generic_timeout_seconds' => min(120, max(5, (int) ($payload['generic_timeout_seconds'] ?? $defaults['generic_timeout_seconds']))),
+                'generic_success_statuses' => $this->normalizeGenericSuccessStatuses($payload['generic_success_statuses'] ?? $defaults['generic_success_statuses']),
+                'generic_health_method' => strtoupper((string) ($payload['generic_health_method'] ?? $defaults['generic_health_method'])),
+                'generic_health_path' => $this->normalizeGenericPath($payload['generic_health_path'] ?? $defaults['generic_health_path']),
+                'generic_publish_method' => strtoupper((string) ($payload['generic_publish_method'] ?? $defaults['generic_publish_method'])),
+                'generic_publish_path' => $this->normalizeGenericPath($payload['generic_publish_path'] ?? $defaults['generic_publish_path']),
+                'generic_update_method' => strtoupper((string) ($payload['generic_update_method'] ?? $defaults['generic_update_method'])),
+                'generic_update_path' => $this->normalizeGenericPath($payload['generic_update_path'] ?? $defaults['generic_update_path']),
+                'generic_delete_method' => strtoupper((string) ($payload['generic_delete_method'] ?? $defaults['generic_delete_method'])),
+                'generic_delete_path' => $this->normalizeGenericPath($payload['generic_delete_path'] ?? $defaults['generic_delete_path']),
+                'generic_settings_method' => strtoupper((string) ($payload['generic_settings_method'] ?? $defaults['generic_settings_method'])),
+                'generic_settings_path' => $this->normalizeGenericPath($payload['generic_settings_path'] ?? $defaults['generic_settings_path']),
+                'generic_remote_id_path' => trim((string) ($payload['generic_remote_id_path'] ?? $defaults['generic_remote_id_path'])),
+                'generic_remote_url_path' => trim((string) ($payload['generic_remote_url_path'] ?? $defaults['generic_remote_url_path'])),
+                'generic_payload_wrapper' => (string) ($payload['generic_payload_wrapper'] ?? $defaults['generic_payload_wrapper']),
+            ], $channel);
+        }
+
+        if ($channelType === DistributionChannel::TYPE_CN_PLATFORM) {
+            $defaults = $channel?->resolvedCnPlatformConfig() ?? (new DistributionChannel)->resolvedCnPlatformConfig();
+            $storedPersona = is_array($channel?->channel_config) ? ($channel->channel_config['cn_mp_persona_id'] ?? null) : null;
+
+            return $this->withExistingFrontendCapabilitiesCache([
+                'article_text_ad_policy' => $articleTextAdPolicy,
+                'frontend_experience_mode' => $frontendExperienceMode,
+                'cn_platform' => (string) ($payload['cn_platform'] ?? $defaults['cn_platform']),
+                'cn_auth_mode' => (string) ($payload['cn_auth_mode'] ?? $defaults['cn_auth_mode']),
+                'cn_post_status' => (string) ($payload['cn_post_status'] ?? $defaults['cn_post_status']),
+                'cn_append_source_link' => array_key_exists('cn_append_source_link', $payload)
+                    ? filter_var($payload['cn_append_source_link'], FILTER_VALIDATE_BOOLEAN)
+                    : $defaults['cn_append_source_link'],
+                'cn_title_limit' => (int) ($payload['cn_title_limit'] ?? $defaults['cn_title_limit']),
+                'cn_summary_limit' => (int) ($payload['cn_summary_limit'] ?? $defaults['cn_summary_limit']),
+                'cn_api_base' => trim((string) ($payload['cn_api_base'] ?? $defaults['cn_api_base'])),
+                'cn_api_publish_url' => trim((string) ($payload['cn_api_publish_url'] ?? $defaults['cn_api_publish_url'])),
+                'cn_api_update_url' => trim((string) ($payload['cn_api_update_url'] ?? $defaults['cn_api_update_url'])),
+                'cn_api_method' => strtoupper((string) ($payload['cn_api_method'] ?? $defaults['cn_api_method'])),
+                'cn_api_auth_style' => (string) ($payload['cn_api_auth_style'] ?? $defaults['cn_api_auth_style']),
+                'cn_api_auth_header' => trim((string) ($payload['cn_api_auth_header'] ?? $defaults['cn_api_auth_header'])),
+                'cn_api_title_field' => trim((string) ($payload['cn_api_title_field'] ?? $defaults['cn_api_title_field'])),
+                'cn_api_content_field' => trim((string) ($payload['cn_api_content_field'] ?? $defaults['cn_api_content_field'])),
+                'cn_api_url_field' => trim((string) ($payload['cn_api_url_field'] ?? $defaults['cn_api_url_field'])),
+                'cn_api_remote_id_path' => trim((string) ($payload['cn_api_remote_id_path'] ?? $defaults['cn_api_remote_id_path'])),
+                'cn_api_remote_url_path' => trim((string) ($payload['cn_api_remote_url_path'] ?? $defaults['cn_api_remote_url_path'])),
+                'cn_content_format' => (string) ($payload['cn_content_format'] ?? $defaults['cn_content_format']),
+                'cn_image_strategy' => (string) ($payload['cn_image_strategy'] ?? $defaults['cn_image_strategy']),
+                'cn_write_url' => trim((string) ($payload['cn_write_url'] ?? $defaults['cn_write_url'])),
+                'cn_mp_persona_id' => filled($payload['cn_mp_persona_id'] ?? null)
+                    ? (int) $payload['cn_mp_persona_id']
+                    : ($storedPersona !== null ? (int) $storedPersona : null),
+            ], $channel);
+        }
+
+        if ($channelType !== 'wordpress_rest') {
+            return $this->withExistingFrontendCapabilitiesCache([
+                'article_text_ad_policy' => $articleTextAdPolicy,
+                'frontend_experience_mode' => $frontendExperienceMode,
+            ], $channel);
+        }
+
+        $defaults = $channel?->resolvedChannelConfig() ?? [
+            'wordpress_username' => '',
+            'wordpress_post_status' => 'publish',
+            'wordpress_category_strategy' => 'match_or_create',
+            'wordpress_fixed_category' => '',
+            'wordpress_tag_strategy' => 'keywords_to_tags',
+            'wordpress_image_strategy' => 'upload_to_media',
+            'wordpress_content_format' => 'html',
+        ];
+
+        return $this->withExistingFrontendCapabilitiesCache([
+            'article_text_ad_policy' => $articleTextAdPolicy,
+            'frontend_experience_mode' => $frontendExperienceMode,
+            'wordpress_username' => trim((string) ($payload['wordpress_username'] ?? $defaults['wordpress_username'])),
+            'wordpress_post_status' => (string) ($payload['wordpress_post_status'] ?? $defaults['wordpress_post_status']),
+            'wordpress_category_strategy' => (string) ($payload['wordpress_category_strategy'] ?? $defaults['wordpress_category_strategy']),
+            'wordpress_fixed_category' => trim((string) ($payload['wordpress_fixed_category'] ?? $defaults['wordpress_fixed_category'])),
+            'wordpress_tag_strategy' => (string) ($payload['wordpress_tag_strategy'] ?? $defaults['wordpress_tag_strategy']),
+            'wordpress_image_strategy' => (string) ($payload['wordpress_image_strategy'] ?? $defaults['wordpress_image_strategy']),
+            'wordpress_content_format' => 'html',
+        ], $channel);
+    }
+
+    /**
+     * @param  array<string,mixed>  $config
+     * @return array<string,mixed>
+     */
+    private function withExistingFrontendCapabilitiesCache(array $config, ?DistributionChannel $channel): array
+    {
+        $stored = is_array($channel?->channel_config) ? $channel->channel_config : [];
+        if (array_key_exists(DistributionChannel::FRONTEND_CAPABILITIES_CACHE_KEY, $stored)) {
+            $config[DistributionChannel::FRONTEND_CAPABILITIES_CACHE_KEY] = DistributionChannel::normalizeFrontendCapabilitiesCache(
+                $stored[DistributionChannel::FRONTEND_CAPABILITIES_CACHE_KEY]
+            );
+        }
+
+        return $config;
+    }
+
+    /**
+     * @return array{
+     *   content_top:array{mode:string,ad_ids:list<string>},
+     *   content_bottom:array{mode:string,ad_ids:list<string>}
+     * }
+     */
+    private function normalizeArticleTextAdPolicy(mixed $policy, ?DistributionChannel $channel = null): array
+    {
+        if ($policy === null) {
+            return $channel?->resolvedArticleTextAdPolicy()
+                ?? DistributionChannel::normalizeArticleTextAdPolicy(null);
+        }
+
+        return DistributionChannel::normalizeArticleTextAdPolicy($policy);
+    }
+
+    /**
+     * @return array{key_id:string,secret:string}
+     */
+    private function createChannelSecret(DistributionChannel $channel): array
+    {
+        $keyId = 'gfk_'.Str::lower(Str::random(18));
+        $plainSecret = 'gfsec_'.Str::random(40);
+
+        DistributionChannelSecret::query()->create([
+            'distribution_channel_id' => (int) $channel->id,
+            'key_id' => $keyId,
+            'secret_ciphertext' => $this->apiKeyCrypto->encrypt($plainSecret),
+            'status' => 'active',
+            'scopes' => ['article.publish', 'article.update', 'article.delete', 'site.settings.update', 'health.check', 'frontend.capabilities'],
+        ]);
+
+        return [
+            'key_id' => $keyId,
+            'secret' => $plainSecret,
+        ];
+    }
+
+    private function createWordPressSecret(DistributionChannel $channel, string $applicationPassword): void
+    {
+        DistributionChannelSecret::query()->create([
+            'distribution_channel_id' => (int) $channel->id,
+            'key_id' => 'wp_'.Str::lower(Str::random(18)),
+            'secret_ciphertext' => $this->apiKeyCrypto->encrypt($applicationPassword),
+            'status' => 'active',
+            'scopes' => ['wordpress.rest'],
+        ]);
+    }
+
+    private function createGenericHttpSecret(DistributionChannel $channel, string $secret): void
+    {
+        DistributionChannelSecret::query()->create([
+            'distribution_channel_id' => (int) $channel->id,
+            'key_id' => 'gapi_'.Str::lower(Str::random(18)),
+            'secret_ciphertext' => $this->apiKeyCrypto->encrypt($secret),
+            'status' => 'active',
+            'scopes' => ['generic.http'],
+        ]);
+    }
+
+    /**
+     * @param  array<string,mixed>  $payload
+     */
+    private function replaceCnPlatformSecret(DistributionChannel $channel, array $payload): void
+    {
+        $token = trim((string) ($payload['cn_secret_token'] ?? ''));
+        if ($token === '') {
+            $token = trim((string) ($payload['cn_secret_token_api'] ?? ''));
+        }
+
+        $plain = array_filter([
+            'access_token' => $token,
+            'uid' => trim((string) ($payload['cn_secret_uid'] ?? '')),
+            'app_key' => trim((string) ($payload['cn_secret_app_key'] ?? '')),
+            'app_secret' => trim((string) ($payload['cn_secret_app_secret'] ?? '')),
+            'redirect_uri' => trim((string) ($payload['cn_secret_redirect_uri'] ?? '')),
+        ], static fn (string $value): bool => $value !== '');
+
+        if ($plain === []) {
+            return;
+        }
+
+        DistributionChannelSecret::query()
+            ->where('distribution_channel_id', (int) $channel->id)
+            ->where('status', 'active')
+            ->update(['status' => 'revoked']);
+
+        DistributionChannelSecret::query()->create([
+            'distribution_channel_id' => (int) $channel->id,
+            'key_id' => 'cn_'.Str::lower(Str::random(18)),
+            'secret_ciphertext' => $this->apiKeyCrypto->encrypt(json_encode($plain, JSON_UNESCAPED_UNICODE)),
+            'status' => 'active',
+            'scopes' => ['cn.platform'],
+        ]);
+    }
+
+    /**
+     * @return list<int>
+     */
+    private function normalizeGenericSuccessStatuses(mixed $value): array
+    {
+        $items = is_array($value) ? $value : explode(',', (string) $value);
+        $statuses = [];
+        foreach ($items as $item) {
+            $status = (int) trim((string) $item);
+            if ($status >= 100 && $status <= 599 && ! in_array($status, $statuses, true)) {
+                $statuses[] = $status;
+            }
+        }
+
+        return $statuses;
+    }
+
+    private function normalizeGenericPath(mixed $path): string
+    {
+        $path = trim((string) $path);
+        if ($path === '') {
+            return '';
+        }
+
+        return str_starts_with($path, '/') ? $path : '/'.$path;
+    }
+
+    /**
+     * @return array<string,array{0:list<string>,1:string}>
+     */
+    private function genericMethodRules(): array
+    {
+        return [
+            'generic_health_method' => [['GET', 'POST'], 'GET'],
+            'generic_publish_method' => [['POST', 'PUT', 'PATCH'], 'POST'],
+            'generic_update_method' => [['POST', 'PUT', 'PATCH'], 'POST'],
+            'generic_delete_method' => [['DELETE', 'POST'], 'DELETE'],
+            'generic_settings_method' => [['POST', 'PUT', 'PATCH'], 'POST'],
+        ];
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function genericHeaderNameFields(): array
+    {
+        return [
+            'generic_header_name',
+            'generic_hmac_key_id_header',
+            'generic_hmac_signature_header',
+            'generic_hmac_timestamp_header',
+            'generic_hmac_nonce_header',
+            'generic_hmac_body_hash_header',
+        ];
+    }
+
+    private function isValidHttpHeaderName(string $headerName): bool
+    {
+        return preg_match('/^[A-Za-z0-9!#$%&\'*+\-.^_`|~]+$/', $headerName) === 1;
+    }
+
+    /**
+     * @return array<string,bool>
+     */
+    private function genericPathFields(): array
+    {
+        return [
+            'generic_health_path' => true,
+            'generic_publish_path' => true,
+            'generic_update_path' => true,
+            'generic_delete_path' => true,
+            'generic_settings_path' => false,
+        ];
+    }
+
+    private function isValidGenericPath(string $path): bool
+    {
+        return ! str_contains($path, '://') && preg_match('/\s/', $path) !== 1;
+    }
+
+    private function setStatus(int $channelId, string $status, string $message): RedirectResponse
+    {
+        $candidate = DistributionChannel::query()->whereKey($channelId)->first();
+        if ($candidate && ($redirect = $this->hostedSiteRedirect($candidate))) {
+            return $redirect;
+        }
+
+        try {
+            $channel = DB::transaction(function () use ($channelId, $status): ?DistributionChannel {
+                $channel = DistributionChannel::query()
+                    ->whereKey($channelId)
+                    ->lockForUpdate()
+                    ->first();
+                if (! $channel || (string) $channel->status === DistributionChannel::STATUS_DELETING) {
+                    return $channel;
+                }
+                $this->channelOperationLeaseService->assertNoActiveLease($channel);
+
+                $channel->forceFill(['status' => $status])->save();
+
+                return $channel;
+            });
+        } catch (DistributionChannelDeletionBlocked $exception) {
+            return $this->channelMutationBlockedResponse($channelId, $exception);
+        }
+        if (! $channel) {
+            return redirect()->route('admin.distribution.index')->withErrors(__('admin.distribution.message.not_found'));
+        }
+        if ($redirect = $this->deletingChannelRedirect($channel)) {
+            return $redirect;
+        }
+
+        return redirect()
+            ->route('admin.distribution.show', ['channelId' => (int) $channel->id])
+            ->with('message', $message);
+    }
+
+    private function deletingChannelRedirect(DistributionChannel $channel): ?RedirectResponse
+    {
+        if ((string) $channel->status !== DistributionChannel::STATUS_DELETING) {
+            return null;
+        }
+
+        return redirect()
+            ->route('admin.distribution.delete', ['channelId' => (int) $channel->id])
+            ->withErrors(__('admin.distribution.delete.operation_blocked'));
+    }
+
+    private function channelMutationBlockedResponse(int $channelId, DistributionChannelDeletionBlocked $exception): RedirectResponse
+    {
+        if ($exception->reason === 'operation_in_progress') {
+            return redirect()
+                ->route('admin.distribution.show', ['channelId' => $channelId])
+                ->withErrors(__('admin.distribution.message.operation_in_progress'));
+        }
+
+        return redirect()
+            ->route('admin.distribution.delete', ['channelId' => $channelId])
+            ->withErrors(__('admin.distribution.delete.operation_blocked'));
+    }
+
+    private function hostedSiteRedirect(DistributionChannel $channel): ?RedirectResponse
+    {
+        if (! $channel->isHostedSite()) {
+            return null;
+        }
+
+        return redirect()->route('admin.distribution.hosted-sites.show', $channel);
+    }
+}

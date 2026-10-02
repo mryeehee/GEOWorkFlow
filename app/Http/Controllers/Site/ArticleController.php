@@ -1,0 +1,141 @@
+<?php
+
+namespace App\Http\Controllers\Site;
+
+use App\Http\Controllers\Controller;
+use App\Models\Article;
+use App\Services\Site\ArticlePermalinkService;
+use App\Services\Site\SiteScopedArticleQuery;
+use App\Services\Site\SiteUrlGenerator;
+use App\Support\Site\ArticleHtmlPresenter;
+use App\Support\Site\ArticleStickyAdPicker;
+use App\Support\Site\ArticleTextAdPicker;
+use App\Support\Site\SiteSettingsBag;
+use App\Support\Site\SiteThemeViewResolver;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\View\View;
+use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
+
+/**
+ * 前台文章详情（对齐旧版 article.php：浏览计数、Markdown 正文、相关文章）。
+ */
+class ArticleController extends Controller
+{
+    public function __construct(
+        private readonly SiteScopedArticleQuery $siteArticles,
+        private readonly SiteUrlGenerator $urls,
+        private readonly ArticlePermalinkService $articlePermalinks,
+    ) {}
+
+    public function resolve(Request $request): View|RedirectResponse
+    {
+        if (! in_array($request->method(), ['GET', 'HEAD'], true)) {
+            throw new NotFoundHttpException(__('site.article_not_found'));
+        }
+
+        return $this->show($request);
+    }
+
+    public function show(Request $request): View|RedirectResponse
+    {
+        $requestPath = (string) parse_url($request->getRequestUri(), PHP_URL_PATH);
+        $resolution = $this->articlePermalinks->resolve($requestPath);
+        if ($resolution === null) {
+            throw new NotFoundHttpException(__('site.article_not_found'));
+        }
+        $article = $resolution->article;
+        $request->attributes->set('article_permalink.article_id', (int) $article->id);
+        $request->attributes->set('article_permalink.source', $resolution->source);
+        $request->attributes->set('article_permalink.reason', $resolution->reason);
+
+        if (! $resolution->isCanonical) {
+            $target = $this->urls->url($resolution->canonicalPath);
+            $query = explode('?', $request->getRequestUri(), 2)[1] ?? '';
+            if (preg_match('/[\x00-\x1F\x7F]/', $query) === 1) {
+                throw new NotFoundHttpException(__('site.article_not_found'));
+            }
+            if (is_string($query) && $query !== '') {
+                $target .= '?'.$query;
+            }
+
+            return redirect()->to($target, 301)->withHeaders([
+                'Cache-Control' => 'public, max-age=3600, s-maxage=300',
+            ]);
+        }
+
+        $map = SiteSettingsBag::all();
+        $siteTitle = (string) ($map['site_name'] ?? config('geoflow.site_name', config('app.name')));
+        $siteDescription = (string) ($map['site_description'] ?? config('geoflow.site_description', ''));
+        $siteKeywords = (string) ($map['site_keywords'] ?? config('geoflow.site_keywords', ''));
+
+        $rawContent = (string) $article->content;
+        $body = ArticleHtmlPresenter::stripLeadingTitleHeading($rawContent, (string) $article->title);
+        $excerpt = trim((string) $article->excerpt);
+        if ($excerpt !== '') {
+            $excerpt = ArticleHtmlPresenter::stripLeadingTitleHeading($excerpt, (string) $article->title);
+        }
+
+        $contentHtml = ArticleTextAdPicker::injectIntoContentHtml(
+            ArticleHtmlPresenter::markdownToHtml($body)
+        );
+        $excerptPlain = $excerpt !== '' ? ArticleHtmlPresenter::cardSummary($article, 160) : '';
+
+        $tags = $this->keywordTags((string) $article->keywords);
+
+        $related = $this->siteArticles->query()
+            ->with('category')
+            ->where('category_id', $article->category_id)
+            ->whereKeyNot($article->id)
+            ->inRandomOrder()
+            ->limit(6)
+            ->get(['id', 'title', 'slug', 'category_id', 'created_at']);
+
+        $pageTitle = (string) $article->title;
+        $pageDescription = $excerptPlain !== '' ? $excerptPlain : ArticleHtmlPresenter::cardSummary($article, 160);
+        $pageKeywords = implode(',', $tags);
+
+        $stickyAd = ArticleStickyAdPicker::firstEnabled();
+
+        return SiteThemeViewResolver::first('article', [
+            'activeNav' => 'article',
+            'article' => $article,
+            'contentHtml' => $contentHtml,
+            'excerptPlain' => $excerptPlain,
+            'tags' => $tags,
+            'relatedArticles' => $related,
+            'siteTitle' => $siteTitle,
+            'siteDescription' => $siteDescription,
+            'siteKeywords' => $siteKeywords,
+            'pageTitle' => $pageTitle,
+            'pageDescription' => $pageDescription,
+            'pageKeywords' => $pageKeywords,
+            'pageOgType' => 'article',
+            'stickyAd' => $stickyAd,
+            'canonicalUrl' => $this->urls->article($article),
+        ]);
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function keywordTags(string $keywords): array
+    {
+        $keywords = trim($keywords);
+        if ($keywords === '') {
+            return [];
+        }
+
+        $parts = preg_split('/[,，、\n]+/u', $keywords) ?: [];
+
+        $out = [];
+        foreach ($parts as $part) {
+            $t = trim((string) $part);
+            if ($t !== '' && ! in_array($t, $out, true)) {
+                $out[] = $t;
+            }
+        }
+
+        return array_slice($out, 0, 12);
+    }
+}

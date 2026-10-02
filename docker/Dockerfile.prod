@@ -1,0 +1,156 @@
+ARG COMPOSER_IMAGE=composer:2
+ARG PHP_FPM_IMAGE=php:8.4-fpm-bookworm
+ARG PECL_REDIS_VERSION=6.3.0
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
+FROM ${COMPOSER_IMAGE} AS vendor
+
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ENV HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY} \
+    NO_PROXY=${NO_PROXY}
+
+WORKDIR /app
+
+# composer:2 基于 Alpine；国内 ECS 需替换 apk 源（与 dev Dockerfile 的 Debian 镜像策略一致）
+RUN set -eux; \
+    if [ -f /etc/apk/repositories ]; then \
+        sed -i 's|dl-cdn.alpinelinux.org|mirrors.aliyun.com|g' /etc/apk/repositories; \
+    fi
+
+ARG COMPOSER_PACKAGIST_MIRROR=
+ENV COMPOSER_ALLOW_SUPERUSER=1 \
+    COMPOSER_MEMORY_LIMIT=-1 \
+    COMPOSER_PROCESS_TIMEOUT=2000 \
+    COMPOSER_MAX_PARALLEL_HTTP=4
+
+RUN if [ -n "${COMPOSER_PACKAGIST_MIRROR}" ]; then \
+        composer config -g repo.packagist composer "${COMPOSER_PACKAGIST_MIRROR}"; \
+    fi
+
+COPY composer.json composer.lock ./
+RUN --mount=type=cache,id=geoflow-composer-dist,target=/tmp/composer-cache,sharing=locked \
+    set -eu; \
+    export COMPOSER_CACHE_DIR=/tmp/composer-cache; \
+    for attempt in 1 2 3; do \
+        if composer install \
+            --no-dev \
+            --no-interaction \
+            --prefer-dist \
+            --ignore-platform-req=ext-pcntl \
+            --classmap-authoritative \
+            --no-scripts; then \
+            break; \
+        fi; \
+        if [ "$attempt" -eq 3 ]; then \
+            echo "Composer dependency download failed after three attempts." >&2; \
+            exit 1; \
+        fi; \
+        echo "Composer dependency download failed; retrying attempt $((attempt + 1)) of 3." >&2; \
+        sleep "$((attempt * 15))"; \
+    done
+
+COPY . .
+
+RUN mkdir -p \
+        bootstrap/cache \
+        storage/app/public/uploads/images \
+        storage/app/tmp \
+        storage/framework/cache/data \
+        storage/framework/sessions \
+        storage/framework/views \
+        storage/logs \
+ && composer dump-autoload \
+    --no-dev \
+    --no-interaction \
+    --classmap-authoritative \
+    --no-scripts \
+ && BROADCAST_CONNECTION=null php artisan package:discover --ansi
+
+FROM node:22-bookworm-slim AS assets
+
+WORKDIR /app
+
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ENV HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY} \
+    NO_PROXY=${NO_PROXY}
+
+RUN npm config set registry https://registry.npmmirror.com/
+
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+COPY resources ./resources
+COPY public ./public
+COPY vite.config.js ./
+
+RUN npm run build
+
+FROM ${PHP_FPM_IMAGE}
+
+ARG PECL_REDIS_VERSION
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ENV HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY} \
+    NO_PROXY=${NO_PROXY}
+
+WORKDIR /var/www/html
+
+RUN set -eux; \
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources; \
+        sed -i 's|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources; \
+    elif [ -f /etc/apt/sources.list ]; then \
+        sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list; \
+        sed -i 's|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list; \
+    fi
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        ffmpeg \
+        libonig-dev \
+        libpq-dev \
+        libsqlite3-dev \
+        libzip-dev \
+        postgresql-client \
+        unzip \
+    && docker-php-ext-install \
+        mbstring \
+        opcache \
+        pcntl \
+        pdo_pgsql \
+        pdo_sqlite \
+        zip \
+    && curl -fsSL "https://pecl.php.net/get/redis-${PECL_REDIS_VERSION}.tgz" -o /tmp/redis.tgz \
+    && pecl install /tmp/redis.tgz \
+    && docker-php-ext-enable redis \
+    && rm -f /tmp/redis.tgz \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY docker/php/opcache.ini /usr/local/etc/php/conf.d/99-opcache.ini
+COPY docker/php/php-docker-overrides.ini /usr/local/etc/php/conf.d/99-overrides.ini
+COPY docker/php-fpm/www.conf /usr/local/etc/php-fpm.d/zz-geoflow.conf
+COPY docker/entrypoint.prod.sh /usr/local/bin/geoflow-entrypoint-prod
+
+RUN chmod +x /usr/local/bin/geoflow-entrypoint-prod
+
+COPY --from=vendor /app /var/www/html
+COPY --from=assets /app/public/build /var/www/html/public/build
+
+# 构建时创建存储链接，让非 root 运行进程直接使用挂载的公共存储。
+RUN ln -sT /var/www/html/storage/app/public public/storage \
+ && chown -R www-data:www-data storage bootstrap/cache
+
+ENTRYPOINT ["/usr/local/bin/geoflow-entrypoint-prod"]
+CMD ["php-fpm", "-F"]

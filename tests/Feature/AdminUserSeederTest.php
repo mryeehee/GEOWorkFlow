@@ -1,0 +1,94 @@
+<?php
+
+namespace Tests\Feature;
+
+use App\Models\Admin;
+use Database\Seeders\AdminUserSeeder;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Config;
+use Illuminate\Support\Facades\Hash;
+use Tests\TestCase;
+
+class AdminUserSeederTest extends TestCase
+{
+    use RefreshDatabase;
+
+    public function test_admin_user_seeder_creates_default_admin(): void
+    {
+        $this->seed(AdminUserSeeder::class);
+
+        $admin = Admin::query()->where('username', 'admin')->first();
+
+        $this->assertNotNull($admin);
+        $this->assertSame('admin@example.com', $admin->email);
+        $this->assertSame('Administrator', $admin->display_name);
+        $this->assertSame('super_admin', $admin->role);
+        $this->assertSame('active', $admin->status);
+        $this->assertTrue(Hash::check('password', (string) $admin->password));
+    }
+
+    /**
+     * 验证 Seeder 从配置层读取初始管理员账号，兼容 config:cache 场景。
+     */
+    public function test_admin_user_seeder_uses_configured_initial_credentials(): void
+    {
+        Config::set('geoflow.initial_admin_username', 'owner');
+        Config::set('geoflow.initial_admin_email', 'owner@example.com');
+        Config::set('geoflow.initial_admin_password', 'owner-secret');
+
+        $this->seed(AdminUserSeeder::class);
+
+        $admin = Admin::query()->where('username', 'owner')->first();
+
+        $this->assertNotNull($admin);
+        $this->assertSame('owner@example.com', $admin->email);
+        $this->assertTrue(Hash::check('owner-secret', (string) $admin->password));
+    }
+
+    public function test_admin_user_seeder_does_not_overwrite_existing_credentials(): void
+    {
+        $admin = Admin::query()->create([
+            'username' => 'admin',
+            'email' => 'original-admin@example.com',
+            'password' => 'existing-secret',
+            'display_name' => 'Original Admin',
+            'role' => 'super_admin',
+            'status' => 'active',
+        ]);
+
+        $originalPasswordHash = (string) $admin->password;
+
+        $this->seed(AdminUserSeeder::class);
+
+        $admin->refresh();
+
+        $this->assertSame('original-admin@example.com', $admin->email);
+        $this->assertSame('Original Admin', $admin->display_name);
+        $this->assertSame($originalPasswordHash, (string) $admin->password);
+        $this->assertTrue(Hash::check('existing-secret', (string) $admin->password));
+        $this->assertSame(1, Admin::query()->where('username', 'admin')->count());
+    }
+
+    public function test_admin_user_seeder_preserves_existing_admin_role_and_status(): void
+    {
+        $admin = Admin::query()->create([
+            'username' => 'admin',
+            'email' => 'custom-admin@example.com',
+            'password' => 'custom-secret-123',
+            'display_name' => 'Custom Admin',
+            'role' => 'admin',
+            'status' => 'inactive',
+        ]);
+
+        $this->seed(AdminUserSeeder::class);
+
+        $admin->refresh();
+
+        $this->assertSame('custom-admin@example.com', $admin->email);
+        $this->assertSame('Custom Admin', $admin->display_name);
+        $this->assertSame('admin', $admin->role);
+        $this->assertSame('inactive', $admin->status);
+        $this->assertTrue(Hash::check('custom-secret-123', (string) $admin->password));
+        $this->assertSame(1, Admin::query()->where('username', 'admin')->count());
+    }
+}
