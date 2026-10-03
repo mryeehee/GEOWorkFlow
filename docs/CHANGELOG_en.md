@@ -2,6 +2,17 @@
 
 This document tracks user-facing updates in the public repository. For future GitHub pushes, update this file together with the Chinese version in `CHANGELOG.md`.
 
+## 2026-10-03
+
+### v3.2.0-beta.2
+
+- GEOWorkFlow brand customization: display name, repository URLs, update sources (version.json / Release assets) and deploy scripts all point to `mryeehee/GEOWorkFlow`, keeping upstream GEOFlow attribution and the AGPL-3.0 license.
+- Admin v3 shell and operations cockpit: sidebar rebuilt per Apple HIG (collapsible, resizable, recent sessions, community-group entry) with redesigned module pages; global design tokens support dark mode.
+- CN content-platform distribution: 10 platform presets (Zhihu, Weibo, Xiaohongshu, Baijiahao, Sohu, Sina, CSDN, Bilibili, Douban, Toutiao) × 3 authorization modes (API / browser connection / manual assist), wired end-to-end with task management and distribution policies.
+- Six GEO capabilities: brand profile center, curated AI-citation source presets, GEO standard article structure injected into the generation pipeline, scheduled AI-visibility crawling, hot keyword mining, and content-direction suggestions.
+- AI configurator quick flow: the overview page adds a complete required-setup guide and a configuration status checklist; when creating a model, selecting a provider preset now surfaces its direct API Key portal (OpenAI, Google Gemini, DeepSeek, Zhipu, Volcengine Ark, MiniMax consoles).
+- Community and attribution: WeChat group QR code updated, all x.com links and related elements removed, footer copyright changed to © 2026 Mryeehee.
+
 ## 2026-09-16
 
 ### v3.2.0-beta.1

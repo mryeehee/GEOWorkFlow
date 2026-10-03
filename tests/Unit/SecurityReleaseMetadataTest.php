@@ -12,25 +12,25 @@ class SecurityReleaseMetadataTest extends TestCase
         $manifest = json_decode((string) file_get_contents(base_path('version.json')), true, flags: JSON_THROW_ON_ERROR);
         $payload = $manifest['payload'];
 
-        $this->assertSame('3.2.0-beta.1', $manifest['version']);
-        $this->assertSame('v3.2.0-beta.1', $manifest['tag']);
-        $this->assertSame('2026-09-16', $manifest['release_date']);
+        $this->assertSame('3.2.0-beta.2', $manifest['version']);
+        $this->assertSame('v3.2.0-beta.2', $manifest['tag']);
+        $this->assertSame('2026-10-03', $manifest['release_date']);
         $this->assertSame('minor', $manifest['release_type']);
         $this->assertTrue(Semver::satisfies($manifest['version'], $manifest['version']));
         $this->assertSame(
-            'https://github.com/mryeehee/GEOWorkFlow/releases/download/v3.2.0-beta.1/GEOWorkFlow-v3.2.0-beta.1.zip',
+            'https://github.com/mryeehee/GEOWorkFlow/releases/download/v3.2.0-beta.2/GEOWorkFlow-v3.2.0-beta.2.zip',
             $manifest['archive_url'],
         );
         $this->assertSame(
-            'https://github.com/mryeehee/GEOWorkFlow/releases/tag/v3.2.0-beta.1',
+            'https://github.com/mryeehee/GEOWorkFlow/releases/tag/v3.2.0-beta.2',
             $payload['release_url'],
         );
         $this->assertSame(
-            'https://github.com/mryeehee/GEOWorkFlow/blob/v3.2.0-beta.1/docs/CHANGELOG.md',
+            'https://github.com/mryeehee/GEOWorkFlow/blob/v3.2.0-beta.2/docs/CHANGELOG.md',
             $payload['changelog_url_zh'],
         );
         $this->assertSame(
-            'https://github.com/mryeehee/GEOWorkFlow/blob/v3.2.0-beta.1/docs/CHANGELOG_en.md',
+            'https://github.com/mryeehee/GEOWorkFlow/blob/v3.2.0-beta.2/docs/CHANGELOG_en.md',
             $payload['changelog_url_en'],
         );
 
@@ -69,8 +69,8 @@ class SecurityReleaseMetadataTest extends TestCase
         $this->assertStringContainsString("## 2026-09-05\n\n### v3.0.0", $en);
         $this->assertStringContainsString("## 2026-09-09\n\n### v3.1.0", $zh);
         $this->assertStringContainsString("## 2026-09-09\n\n### v3.1.0", $en);
-        $this->assertStringContainsString('### v3.2.0-beta.1', $zh);
-        $this->assertStringContainsString('### v3.2.0-beta.1', $en);
+        $this->assertStringContainsString('### v3.2.0-beta.2', $zh);
+        $this->assertStringContainsString('### v3.2.0-beta.2', $en);
     }
 
     public function test_environment_examples_do_not_lock_the_application_version(): void
