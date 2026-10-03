@@ -218,12 +218,6 @@ html[data-gf-ui-booting] .gf-admin-v3 *::after {
     }
 }
 
-@media (max-width: 767px) and (max-height: 628px) {
-    html[data-gf-sidebar-state='collapsed'] .gf-admin-v3 .gf-sidebar__recent {
-        display: none;
-    }
-}
-
 @media (prefers-reduced-motion: reduce) {
     .gf-admin-v3 .gf-sidebar,
     .gf-admin-v3 .gf-shell__body {

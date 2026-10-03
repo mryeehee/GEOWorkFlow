@@ -209,8 +209,9 @@ export function setupSidebarRecent({
 
     toggle.addEventListener('click', () => applyCollapsedState(!state.collapsed));
     retry.addEventListener('click', () => void refresh({ force: true }));
-    scroll.addEventListener('scroll', () => {
-        if (scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight > 32) return;
+    const scrollHost = (scroll.closest && scroll.closest('.gf-sidebar__nav')) || scroll;
+    scrollHost.addEventListener('scroll', () => {
+        if (scrollHost.scrollHeight - scrollHost.scrollTop - scrollHost.clientHeight > 32) return;
         void loadMore();
     }, { passive: true });
     list.addEventListener('click', async (event) => {
